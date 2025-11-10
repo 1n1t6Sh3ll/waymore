@@ -1,5 +1,35 @@
 ## Changelog
 
+- v6.6
+
+  - Changed
+
+    - The `-from`/`--from-date` and `-to`/`--to-date` arguments were not used for getting URLs from Wayback Archive, only for responses. These have been changed to apply to both mode `U` and mode `R` for Wayback. They will not be used for URLs if the `-f`/`--filter-responses-only` argument is passed.
+    - The `-lcy` argument will be removed and the `-from`/`--from-date` and `-to`/`--to-date` arguments will now determine which Common Crawl indexes to get and which records from the files will be returned if filtering is required.
+    - The `-from`/`--from-date` and `-to`/`--to-date` arguments were also not used for getting URLs from Common Crawl, Alien Vault and Virus Total within the date limits. **IMPORTANT: There are some exceptions with sources unable to get URLs within date limits: Virus Total - all known sub domains will still be returned; Intelligence X - all URLs will still be returned.**
+
+- v6.5
+
+  - New
+
+    - Added GitHub Actions CI workflow with automated linting (ruff), formatting checks (black), and testing (pytest) across Python 3.9-3.12
+    - Added `pyproject.toml` with modern Python project configuration and tool settings
+    - Added basic test suite with import test
+    - Added `docker-entrypoint.sh` for proper permission handling in Docker containers
+
+  - Changed
+
+    - **Docker improvements**: Upgraded to multi-stage build using Python 3.12-slim for smaller image size and better security
+    - **Docker security**: Container now runs as non-root user (appuser) with proper permission handling via gosu
+    - **Docker build**: Now uses `python -m build --wheel` instead of deprecated `setup.py install`
+    - Fixed circular import issue in `setup.py` by adding `get_version()` function to read version via regex
+    - Simplified Docker usage command in README (removed redundant `waymore` command from entrypoint)
+    - Applied black and ruff formatting to `setup.py` and `pyproject.toml`
+
+  - Thanks
+
+    - Thanks to [@Donovoi](https://github.com/Donovoi) for PR [#70](https://github.com/xnl-h4ck3r/waymore/pull/70)
+
 - v6.4
 
   - New
