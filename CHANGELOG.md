@@ -1,5 +1,204 @@
 ## Changelog
 
+- v8.9
+
+  - Changed
+
+    - BUG FIX: When downloading archived responses, the file extension is derived from the URL path. For some URLs (e.g. captured analytics/beacon requests with long query-string-like values after a `.` in the path) this produced an extremely long "extension" that was appended to the filename, causing `[Errno 36] File name too long` errors when writing files. The extension is now validated for length: if the determined extension is longer than 20 characters it is treated as invalid and set to `unknown`, preventing the "File name too long" failures. This check has been applied to both the Wayback/archive and URLScan response-saving code paths.
+
+- v8.8
+
+  - Changed
+
+    - RELIABILITY FIX: Previously, many outbound HTTP requests were made without a timeout, e.g. getting the number of pages/links to search from sources, the URLScan / VirusTotal / Intelligence X API calls, the Common Crawl index collection lookup (including the streaming download of index data), and the Discord / Telegram completion notifications. If a source server was slow or unresponsive, a worker thread could block indefinitely and `waymore` would appear to hang with no way to recover other than killing it. All outbound requests now apply a default timeout of `DEFAULT_TIMEOUT` (30) seconds when one is not explicitly set. This is done via a new `TimeoutSession` wrapper around `requests.Session` that is used for every request. Calls that already specify their own timeout (including archived response downloads controlled by the `-t` / `--timeout` argument) are unaffected and continue to use that value.
+    - DEPENDENCY CLEANUP: Removed unused and incorrectly-scoped dependencies. `aiohttp` and `urlparse3` were listed in `requirements.txt` but are never imported anywhere in the code — URL parsing uses the standard library `urllib.parse`, and concurrency uses `asyncio` with thread pool executors rather than `aiohttp`. `setuptools` was listed as a runtime dependency but is only required at build time (it remains in the `[build-system]` requirements of `pyproject.toml`). The `install_requires` list in `setup.py` has also been reconciled with `requirements.txt` (removing `urlparse3`) so the two no longer disagree. This reduces the install footprint and dependency/CVE surface, with no change to functionality.
+
+- v8.7
+
+  - New
+    - If the `config.yml` file is not found in the expected config directory (e.g. `~/.config/waymore/` on Linux or `%APPDATA%/waymore/` on Windows), it will be automatically created with default values. This fixes the issue where installing with `pipx` did not create the `config.yml` file.
+
+- v8.6
+
+  - Changed
+
+    - BUG FIX: Passing `-ko` / `--keywords-only` or `-ra` / `--regex-after` patterns in **double quotes** in bash (e.g. `-ko "\.js(\?|$)"`) causes `$)` to be expanded by the shell to an empty string, giving an invalid regex `\.js(\?|` (unbalanced parenthesis). The resulting `re.error` was silently swallowed, returning no results with no explanation. Both `-ko` and `-ra` patterns are now validated immediately after argument parsing; an invalid regex exits with a clear error and a tip to use single quotes (e.g. `-ko '\. js(\?|$)'`).
+    - CHANGE: The `-ko` / `--keywords-only` pattern is wrapped for the Wayback CDX and Common Crawl APIs by a new `cdxKeywordsFilter()` helper. It always adds a `.*` prefix so the pattern can match anywhere in the URL (both APIs use Python `re.match()` semantics (anchors to start of string, not full-string)). Whether a `.*` suffix is added depends on the pattern: if it contains an **unescaped `$`** the suffix is omitted (the `$` anchors to end-of-URL already); otherwise `.*` is appended so the pattern acts as a substring match. Examples: `\.js` → `filter=...(\.js).*`; `\.js(\?.*|$)` → `filter=...(\.js(\?.*|$))`. If the Wayback CDX API returns a 502/504 Gateway Timeout when `-ko` is used, a message is shown. The Common Crawl verbose output (`-v`) also now correctly includes the full requested index URL with the keywords filter.
+    - BUG FIX: The `-ft` / `--filter-mime-types` and `-mt` / `--match-mime-types` arguments rejected valid MIME types containing characters such as `.`, `_`, `!`, etc. The validation regex has been updated to allow all RFC-valid MIME token characters (`A-Z a-z 0-9 ! # $ % & ' * + - . ^ _ backtick { | } ~`) on each side of exactly one `/`.
+
+- v8.5
+
+  - Changed
+
+    - BUG FIX: Fixed [Issue #80](https://github.com/xnl-h4ck3r/waymore/issues/80) - Input paths containing spaces (e.g., `thetrove.is/Books/Zardoz RPG/`) were failing because URL-encoded spaces (`%20`) in returned URLs didn't match the literal spaces in the input. Now uses URL decoding before comparison.
+    - BUG FIX: Fixed [Issue #80](https://github.com/xnl-h4ck3r/waymore/issues/80) - Input paths were incorrectly forced to lowercase. URL paths are case-sensitive, so now only the hostname portion is lowercased while the path case is preserved.
+
+- v8.4
+
+  - Changed
+
+    - BUG FIX: The error `ERROR processURLScanUrl 1: 'NoneType' object has no attribute 'add'` was fixed by ensuring that the `linksFoundURLScan` and `linkMimes` variables are initialized before they are used. A similar fix was applied to many other variables to prevent similar errors.
+
+- v8.3
+
+  - Changed
+
+    - **Dual-Method Config Creation**: Restored the setup-time configuration creation logic in `setup.py` while maintaining the robust runtime fallback in `waymore.py`. This ensures better visibility and immediate setup for traditional installations while keeping `pipx` and wheel installations fully supported.
+    - Minor cleanup and line-spacing improvements.
+
+- v8.2
+
+  - Changed
+
+    - **Reliable Config Creation**: Improved the configuration file creation logic to ensure it works across all installation methods (e.g., `pipx`). The config file is now created robustly at runtime if it doesn't already exist.
+    - Improved platform-specific path detection for Windows, Linux, and macOS.
+    - Fixed a bug where providing a relative path via `-c` would fail to create the default config if the directory was not already present.
+    - Removed redundant and fragile install-time config copying logic from `setup.py`.
+
+- v8.1
+
+  - New
+
+    - **Auto-create config.yml**: If the `config.yml` file is not found in the default location when `waymore` runs, it will now be automatically created with default values. This fixes issues where the config file was not created during installation for some users.
+
+- v8.0
+
+  - New
+
+    - **GhostArchive Source**: Added [GhostArchive](https://ghostarchive.org/) as a new URL source for `-mode U` AND `-mode R`. This source doesn't have an API, so waymore crawls the HTML pages directly to extract archived URLs. The source paginates automatically until no more results are found. For `-mode R` it will download the WARC files and extract the HTTP Responses and extra URLs from them.
+    - Added `-xga` argument to exclude checks for links from ghostarchive.org.
+    - Updated `--providers` argument to accept `ghostarchive` as a valid provider value.
+    - Added `.avif` to `FILTER_URL` and `image/avif` to `FILTER_MIME` in `config.yml` and default values in `DEFAULT_FILTER_URL` and `DEFAULT_FILTER_MIME`.
+
+  - Changed
+
+    - Remove `application/pdf` from `FILTER_MIME` in `config.yml` and default values in `DEFAULT_FILTER_MIME`. These files can contain valuable information and should not be filtered out.
+
+- v7.7
+
+  - New
+
+    - Add a few more audio and video extensions to `FILTER_URL` in `config.yml` and default values in `DEFAULT_FILTER_URL`
+    - Add few more audio and video MIME type to `FILTER_MIME` in `config.yml` and default values in `DEFAULT_FILTER_MIME`
+    - Added extar debug info to show the file being processed so if waymore seems to freeze on a specific file I can investigate.
+
+  - Changed
+
+    - **Binary File Download Fix**: Fixed critical bug where binary files (`.zip`, `.pdf`, `.gz`, images, etc.) downloaded (with `-mode R`) were corrupted. The issue was that all responses were being handled as text (`resp.text`) and written in text mode with UTF-8 encoding, which mangles binary data during the encoding/decoding cycle.
+    - Added `BINARY_EXTENSIONS` constant containing 50+ binary file extensions (`.zip`, `.gz`, `.pdf`, `.exe`, `.png`, `.mp4`, fonts, archives, etc.)
+    - Added `BINARY_MIME_TYPES` constant containing 40+ binary MIME types (`application/zip`, `application/pdf`, `image/*`, `audio/*`, `video/*`, etc.)
+    - Replaced `isBinaryFile()` with improved `isBinaryContent()` function that now checks actual content bytes for file signatures. This ensures HTML error pages are correctly treated as text even if the URL has a binary extension like `.pdf`. Priority order: (1) content inspection for file magic bytes, (2) Content-Type header, (3) URL extension as fallback.
+    - Binary files are now downloaded using `resp.content` (raw bytes) and written using binary mode (`"wb"`), preserving the original file data
+    - Text files continue to use decoded bytes with UTF-8 encoding and Wayback cleanup regex processing
+    - Binary files that cannot determine an extension will use `.bin` instead of `.unknown`
+    - **Raw Wayback Downloads (`id_` modifier)**: For binary files, the Wayback Machine URL now includes the `id_` modifier (e.g., `/web/20090315210455id_/http://...`) which retrieves the raw original file without any Wayback Machine modifications. This fixes corruption of media files like `.wmv`, `.mp4`, etc.
+    - Added `isLikelyBinaryUrl()` helper to pre-check if a URL has a binary extension before making the request
+    - Added `addRawModifier()` helper to insert the `id_` modifier into Wayback URLs
+    - Added comprehensive binary file magic bytes signatures
+    - The `--source-ip` option is now only displayed in verbose (`-v`) output when it's explicitly configured. Previously, it always showed a default message even when not set.
+
+- v7.6
+
+  - New
+  
+    - **Source IP Binding**: Added `--source-ip` / `--bind-ip` CLI argument and `SOURCE_IP` config option to bind outbound HTTP/HTTPS requests to a specific source IP address. Useful for multi-homed hosts where you need to use a specific whitelisted IP. Thanks to [fbettag](https://github.com/fbettag) for PR [#79](https://github.com/xnl-h4ck3r/waymore/pull/79).
+  
+  - Changed
+
+    - Fixed `notifyDiscord()` and `notifyTelegram()` functions to use the HTTP adapter for source IP binding consistency.
+    - Added null checks for `HTTP_ADAPTER` in `chooseIntelxBase()` and webhook functions for robustness.
+
+- v7.5
+
+  - New
+
+    - **IntelX Fallback Mechanism**: Added automatic fallback between paid (`2.intelx.io`) and free (`free.intelx.io`) Intelligence X endpoints. The tool now probes endpoints in order and automatically switches to the free endpoint if the paid one returns 401/402/403 errors, improving reliability for users with different API key types.
+    - Added thread-local storage for IntelX URL configuration to support concurrent operations.
+    - Change the README to note that Intelligence X is now an academia or paid tier only source, not just paid.
+    - Thanks to the [aleister1102](https://github.com/aleister1102) for PR [#78](https://github.com/xnl-h4ck3r/waymore/pull/78) for this improvement.
+
+- v7.4
+
+  - BUG FIX: The source specific totals were showing as 0 when running `-mode U` and the error `ERROR processIntelxUrl 1: name 'linksFoundIntelx' is not defined` was shown. This has been fixed.
+
+- v7.3
+
+- Changed
+
+  - The v7.2 changes were not correct to provide support for Telegram notifications. A new optional argument `-nt`/`--notify-telegram` can be used to send a notification to a Telegram webhook when waymore completes. This requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to be provided in the `config.yml` file.
+
+- v7.2
+
+  - New
+
+    - Added support for **Telegram notifications**. A new optional argument `-nt`/`--notify-telegram` can be used to send a notification to a Telegram webhook when waymore completes. This requires `WEBHOOK_TELEGRAM` to be provided in the `config.yml` file.
+
+- v7.1
+
+  - New
+
+    - Add `/_incapsula_resource` to `FILTER_URL` in `config.yml` (and the default constant if the config file is not found) to exclude this common response that is not part of the original target. The response also causes regex "catastrophic backtracking" in `xnLinkFinder` so I am excluding here aswell as looking into solving that problem.
+     
+- v7.0
+
+  - New
+
+    - **Async Concurrent Source Fetching**: Implemented asynchronous concurrent fetching from all URL sources (Wayback Machine, Common Crawl, AlienVault OTX, URLScan, VirusTotal, Intelligence X) for **significantly improved performance (2-4x faster** for multi-source runs).
+    - Added `asyncio` orchestration layer to manage concurrent execution while maintaining backward compatibility with existing synchronous code.
+    - Added `aiohttp` dependency to requirements for async HTTP support.
+    - Added thread-safe locks (`threading.Lock`) to protect shared global state (`linksFound`, `linkMimes`, `urlscanRequestLinks`) from race conditions during concurrent operations.
+
+  - Changed
+
+    - Sources are now fetched **concurrently** instead of sequentially, with proper error handling to ensure one source failure doesn't stop others.
+    - Properly initialized `linksFound` and `linkMimes` as global variables to prevent `NoneType` errors during concurrent access.
+    - Removed local reassignments of global variables in source functions (`getURLScanUrls`, `getCommonCrawlUrls`, `getVirusTotalUrls`) that were causing race conditions.
+    - All `.add()` operations on shared sets are now protected with locks for thread safety.
+    - **Minimum Python version**: Now requires **Python 3.7+** for `async/await` support.
+    - Ensure the default value for `-lcc`/`--limit-common-crawl` is set to 1.
+    - Set the default value for `-p`/`--processes` to 2. This will speed things if people don't specify a value, and shouldn't cause any issues.
+    - Fixed duplicate rate limit messages from AlienVault when using parallel processes by checking `stopSource` before printing the 429 error message.
+    - Fixed issue where AlienVault would show an "Unexpected response" error after a "Rate limit reached" error.
+    - **Wayback streaming improvements**: Wayback Machine requests now use `stream=True` to retrieve results as they arrive. If the connection is interrupted (`Response ended prematurely` error), all URLs processed before the error are still saved instead of losing everything. Error messages now show how many URLs were saved before the connection failed.
+    - **Ctrl-C interrupt for streaming requests (2025-12-03)**: Fix SIGINT handling so a live streaming response is closed when Ctrl-C is pressed, allowing blocking `session.get(..., stream=True)` requests to be interrupted and stop faster. This exposes the active response to the SIGINT handler and closes it to cancel blocking network I/O.
+    - **Session-level interrupt fix (2025-12-03T11:36:18.961Z)**: Also expose and close the active requests.Session when SIGINT is received to more reliably abort blocking streaming requests on some platforms/environments.
+    - **Interruptible rate-limit waits (2025-12-03T12:04:37.195Z)**: Replaced blocking time.sleep() calls used when rate-limited with an interruptible wait driven by a global threading.Event (interrupt_event). The SIGINT handler now sets interrupt_event so rate-limit waits wake early when Ctrl-C is pressed.
+    - **Unique Link Counting**: The link count displayed for each source (Wayback, Common Crawl, etc.) now represents the number of **unique** URLs found from that source, rather than the total number of URLs found (which included duplicates). The final total still shows the unique URLs found across all sources.
+    - **Memory Optimization**: Significant reduction in memory usage by preventing duplicate storage of links. Links are now stored only in source-specific sets during processing and merged into the main set at the end, with source sets being cleared immediately to free up memory.
+    - **Link Counting Consistency**: Fixed a discrepancy where source-specific link counts could be higher than the final total. All link counting now uses the same normalization (removing ports 80/443) and filtering logic to ensure consistency.
+    - **Source-Specific Link Counting**: Added separate link counts for each source (Wayback, Common Crawl, etc.) to provide more detailed information about the number of unique links found from each source.
+    
+    
+- v6.6
+
+  - Changed
+
+    - The `-from`/`--from-date` and `-to`/`--to-date` arguments were not used for getting URLs from Wayback Archive, only for responses. These have been changed to apply to both mode `U` and mode `R` for Wayback. They will not be used for URLs if the `-f`/`--filter-responses-only` argument is passed.
+    - The `-lcy` argument will be removed and the `-from`/`--from-date` and `-to`/`--to-date` arguments will now determine which Common Crawl indexes to get and which records from the files will be returned if filtering is required.
+    - The `-from`/`--from-date` and `-to`/`--to-date` arguments were also not used for getting URLs from Common Crawl, Alien Vault and Virus Total within the date limits. **IMPORTANT: There are some exceptions with sources unable to get URLs within date limits: Virus Total - all known sub domains will still be returned; Intelligence X - all URLs will still be returned.**
+
+- v6.5
+
+  - New
+
+    - Added GitHub Actions CI workflow with automated linting (ruff), formatting checks (black), and testing (pytest) across Python 3.9-3.12
+    - Added `pyproject.toml` with modern Python project configuration and tool settings
+    - Added basic test suite with import test
+    - Added `docker-entrypoint.sh` for proper permission handling in Docker containers
+
+  - Changed
+
+    - **Docker improvements**: Upgraded to multi-stage build using Python 3.12-slim for smaller image size and better security
+    - **Docker security**: Container now runs as non-root user (appuser) with proper permission handling via gosu
+    - **Docker build**: Now uses `python -m build --wheel` instead of deprecated `setup.py install`
+    - Fixed circular import issue in `setup.py` by adding `get_version()` function to read version via regex
+    - Simplified Docker usage command in README (removed redundant `waymore` command from entrypoint)
+    - Applied black and ruff formatting to `setup.py` and `pyproject.toml`
+
+  - Thanks
+
+    - Thanks to [@Donovoi](https://github.com/Donovoi) for PR [#70](https://github.com/xnl-h4ck3r/waymore/pull/70)
+
 - v6.4
 
   - New

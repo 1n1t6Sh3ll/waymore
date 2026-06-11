@@ -4,28 +4,33 @@
 # Full help here: https://github.com/xnl-h4ck3r/waymore/blob/main/README.md
 # Good luck and good hunting! If you really love the tool (or any others), or they helped you find an awesome bounty, consider BUYING ME A COFFEE! (https://ko-fi.com/xnlh4ck3r) ☕ (I could use the caffeine!)
 
-from urllib.parse import urlparse
-import requests
-from requests.exceptions import ConnectionError
-from requests.utils import quote
-from requests.adapters import HTTPAdapter, Retry
 import argparse
-from signal import SIGINT, signal
+import asyncio
+import enum
+import ipaddress
+import json
+import math
 import multiprocessing.dummy as mp
-from termcolor import colored
+import os
+import pickle
+import random
+import re
+import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-import yaml
-import os
-import json
-import re
-import random
-import sys
-import math
-import enum
-import pickle
-import time
+from signal import SIGINT, signal
+from typing import Optional
+from urllib.parse import unquote, urlparse
+
+import requests
 import tldextract
+import yaml
+from requests.adapters import HTTPAdapter, Retry
+from requests.exceptions import ConnectionError
+from requests.utils import quote
+from termcolor import colored
+from urllib3.poolmanager import PoolManager
 
 try:
     from . import __version__
@@ -59,6 +64,13 @@ argsInput = ""
 isInputFile = False
 stopProgramCount = 0
 stopSource = False
+stopSourceWayback = False
+stopSourceCommonCrawl = False
+stopSourceAlienVault = False
+stopSourceURLScan = False
+stopSourceVirusTotal = False
+stopSourceIntelx = False
+stopSourceGhostArchive = False
 successCount = 0
 failureCount = 0
 fileCount = 0
@@ -68,6 +80,7 @@ totalPages = 0
 indexFile = None
 continueRespFile = None
 continueRespFileURLScan = None
+continueRespFileGhostArchive = None
 inputIsDomainANDPath = False
 inputIsSubDomain = False
 subs = "*."
@@ -79,6 +92,10 @@ currentMemUsage = 0
 maxMemoryPercent = 0
 currentMemPercent = 0
 process = None
+current_response = None
+current_session = None
+# Event used to interrupt long sleeps (e.g., rate-limit waits) when SIGINT is received
+interrupt_event = threading.Event()
 HTTP_ADAPTER = None
 HTTP_ADAPTER_CC = None
 checkWayback = 0
@@ -87,26 +104,102 @@ checkAlienVault = 0
 checkURLScan = 0
 checkVirusTotal = 0
 checkIntelx = 0
+checkGhostArchive = 0
 argsInputHostname = ""
 responseOutputDirectory = ""
 urlscanRequestLinks = set()
+intelxAPIIssue = False
+linkCountWayback = 0
+linkCountCommonCrawl = 0
+linkCountAlienVault = 0
+linkCountURLScan = 0
+linkCountVirusTotal = 0
+linkCountIntelx = 0
+linkCountGhostArchive = 0
+linksFoundCommonCrawl = set()
+linksFoundAlienVault = set()
+linksFoundURLScan = set()
+linksFoundVirusTotal = set()
+linksFoundIntelx = set()
+linksFoundGhostArchive = set()
+ghostArchiveRequestLinks = set()
+
+# Thread lock for protecting shared state during concurrent operations
+links_lock = threading.Lock()
+
+# Shared state for link collection across all sources
+linksFound = set()
+linkMimes = set()
+extraWarcLinks = set()  # Track extra URLs found in WARC files for mode B
 
 # Source Provider URLs
 WAYBACK_URL = "https://web.archive.org/cdx/search/cdx?url={DOMAIN}{COLLAPSE}&fl=timestamp,original,mimetype,statuscode,digest"
 CCRAWL_INDEX_URL = "https://index.commoncrawl.org/collinfo.json"
-ALIENVAULT_URL = (
-    "https://otx.alienvault.com/api/v1/indicators/{TYPE}/{DOMAIN}/url_list?limit=500"
-)
-URLSCAN_URL = (
-    "https://urlscan.io/api/v1/search/?q=domain:{DOMAIN}{DATERANGE}&size=10000"
-)
+ALIENVAULT_URL = "https://otx.alienvault.com/api/v1/indicators/{TYPE}/{DOMAIN}/url_list?limit=500"
+URLSCAN_URL = "https://urlscan.io/api/v1/search/?q=domain:{DOMAIN}{DATERANGE}&size=10000"
 URLSCAN_DOM_URL = "https://urlscan.io/dom/"
-VIRUSTOTAL_URL = (
-    "https://www.virustotal.com/vtapi/v2/domain/report?apikey={APIKEY}&domain={DOMAIN}"
-)
-INTELX_SEARCH_URL = "https://2.intelx.io/phonebook/search"
-INTELX_RESULTS_URL = "https://2.intelx.io/phonebook/search/result?id="
-INTELX_ACCOUNT_URL = "https://2.intelx.io/authenticate/info"
+VIRUSTOTAL_URL = "https://www.virustotal.com/vtapi/v2/domain/report?apikey={APIKEY}&domain={DOMAIN}"
+# Paid endpoint first, free endpoint as fallback
+INTELX_BASES = ["https://2.intelx.io", "https://free.intelx.io"]
+GHOSTARCHIVE_URL = "https://ghostarchive.org/search?term={DOMAIN}&page="
+GHOSTARCHIVE_DOM_URL = "https://ghostarchive.org"
+
+intelx_tls = threading.local()
+
+
+def initIntelxTls():
+    """Initialize thread-local storage for IntelX if not already done."""
+    if not hasattr(intelx_tls, "INTELX_BASE"):
+        intelx_tls.INTELX_BASE = INTELX_BASES[0]
+        intelx_tls.INTELX_SEARCH_URL = f"{intelx_tls.INTELX_BASE}/phonebook/search"
+        intelx_tls.INTELX_RESULTS_URL = f"{intelx_tls.INTELX_BASE}/phonebook/search/result?id="
+        intelx_tls.INTELX_ACCOUNT_URL = f"{intelx_tls.INTELX_BASE}/authenticate/info"
+
+
+def setIntelxBase(base: str):
+    """Update IntelX URLs to use the provided base (thread-local)."""
+    initIntelxTls()
+    intelx_tls.INTELX_BASE = base
+    intelx_tls.INTELX_SEARCH_URL = f"{intelx_tls.INTELX_BASE}/phonebook/search"
+    intelx_tls.INTELX_RESULTS_URL = f"{intelx_tls.INTELX_BASE}/phonebook/search/result?id="
+    intelx_tls.INTELX_ACCOUNT_URL = f"{intelx_tls.INTELX_BASE}/authenticate/info"
+
+
+def chooseIntelxBase(api_key: str) -> Optional[requests.Response]:
+    """
+    Probe IntelX endpoints in order (paid, then free) and set the first that works.
+    Returns the last response (or None) so callers can inspect status/JSON.
+    """
+    initIntelxTls()
+    try:
+        session = TimeoutSession()
+        if HTTP_ADAPTER is not None:
+            session.mount("https://", HTTP_ADAPTER)
+            session.mount("http://", HTTP_ADAPTER)
+        last_resp = None
+        for base in INTELX_BASES:
+            userAgent = random.choice(USER_AGENT)
+            try:
+                resp = session.get(
+                    f"{base}/authenticate/info",
+                    headers={"User-Agent": userAgent, "X-Key": api_key},
+                )
+                last_resp = resp
+                if resp.status_code == 200:
+                    setIntelxBase(base)
+                    return resp
+                if resp.status_code in [401, 403]:
+                    # Try next base
+                    continue
+            except Exception as e:
+                writerr(colored(f"IntelX - [ ERR ] Problem probing {base}: {e}", "red"))
+            # For other codes or exceptions, try next base anyway instead of breaking prematurely
+            continue
+        return last_resp
+    except Exception as e:
+        writerr(colored(f"IntelX - [ ERR ] Unexpected error in chooseIntelxBase: {e}", "red"))
+        return None
+
 
 # User Agents to use when making requests, chosen at random
 USER_AGENT = [
@@ -131,17 +224,59 @@ USER_AGENT = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 8_4_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) Version/8.0 Mobile/12H321 Safari/600.1.4",
 ]
 
+
+class SourceAddressAdapter(HTTPAdapter):
+    """
+    HTTPAdapter that binds outbound connections to a specific source IP address
+    """
+
+    def __init__(self, source_ip=None, *args, **kwargs):
+        self.source_ip = source_ip
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        if self.source_ip:
+            # (ip, 0) lets OS choose the port
+            pool_kwargs["source_address"] = (self.source_ip, 0)
+        self.poolmanager = PoolManager(
+            num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
+        )
+
+    def proxy_manager_for(self, *args, **kwargs):
+        if self.source_ip:
+            kwargs.setdefault("proxy_kwargs", {})
+            kwargs["proxy_kwargs"]["source_address"] = (self.source_ip, 0)
+        return super().proxy_manager_for(*args, **kwargs)
+
+
 # The default maximum number of responses to download
 DEFAULT_LIMIT = 5000
 
 # The default timeout for archived responses to be retrieved in seconds
 DEFAULT_TIMEOUT = 30
 
+
+class TimeoutSession(requests.Session):
+    """
+    A requests.Session that applies a default timeout of DEFAULT_TIMEOUT seconds
+    to every request when the caller has not explicitly specified one. This stops
+    requests from blocking indefinitely on slow or unresponsive archive endpoints
+    (many call sites historically omitted a timeout, which could hang the program).
+    Any explicit per-call timeout (e.g. the -t / --timeout value used for archived
+    response downloads) is always respected.
+    """
+
+    def request(self, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = DEFAULT_TIMEOUT
+        return super().request(*args, **kwargs)
+
+
 # Exclusions used to exclude responses we will try to get from web.archive.org
-DEFAULT_FILTER_URL = ".css,.jpg,.jpeg,.png,.svg,.img,.gif,.mp4,.flv,.ogv,.webm,.webp,.mov,.mp3,.m4a,.m4p,.scss,.tif,.tiff,.ttf,.otf,.woff,.woff2,.bmp,.ico,.eot,.htc,.rtf,.swf,.image,/image,/img,/css,/wp-json,/wp-content,/wp-includes,/theme,/audio,/captcha,/font,node_modules,/jquery,/bootstrap"
+DEFAULT_FILTER_URL = ".css,.jpg,.jpeg,.png,.svg,.img,.gif,.mp4,.flv,.ogv,.webm,.webp,.mov,.mp3,.m4a,.m4p,.scss,.tif,.tiff,.ttf,.otf,.woff,.woff2,.bmp,.ico,.eot,.htc,.rtf,.swf,.image,/image,/img,/css,/wp-json,/wp-content,/wp-includes,/theme,/audio,/captcha,/font,node_modules,/jquery,/bootstrap,/_incapsula_resource,.wmv,.wma,.asx,.avif"
 
 # MIME Content-Type exclusions used to filter links and responses from web.archive.org through their API
-DEFAULT_FILTER_MIME = "text/css,image/jpeg,image/jpg,image/png,image/svg+xml,image/gif,image/tiff,image/webp,image/bmp,image/vnd,image/x-icon,image/vnd.microsoft.icon,font/ttf,font/woff,font/woff2,font/x-woff2,font/x-woff,font/otf,audio/mpeg,audio/wav,audio/webm,audio/aac,audio/ogg,audio/wav,audio/webm,video/mp4,video/mpeg,video/webm,video/ogg,video/mp2t,video/webm,video/x-msvideo,video/x-flv,application/font-woff,application/font-woff2,application/x-font-woff,application/x-font-woff2,application/vnd.ms-fontobject,application/font-sfnt,application/vnd.android.package-archive,binary/octet-stream,application/octet-stream,application/pdf,application/x-font-ttf,application/x-font-otf,video/webm,video/3gpp,application/font-ttf,audio/mp3,audio/x-wav,image/pjpeg,audio/basic,application/font-otf,application/x-ms-application,application/x-msdownload,video/x-ms-wmv,image/x-png,video/quicktime,image/x-ms-bmp,font/opentype,application/x-font-opentype,application/x-woff,audio/aiff"
+DEFAULT_FILTER_MIME = "text/css,image/jpeg,image/jpg,image/png,image/svg+xml,image/gif,image/tiff,image/webp,image/bmp,image/vnd,image/x-icon,image/vnd.microsoft.icon,font/ttf,font/woff,font/woff2,font/x-woff2,font/x-woff,font/otf,audio/mpeg,audio/wav,audio/webm,audio/aac,audio/ogg,audio/wav,audio/webm,video/mp4,video/mpeg,video/webm,video/ogg,video/mp2t,video/webm,video/x-msvideo,video/x-flv,application/font-woff,application/font-woff2,application/x-font-woff,application/x-font-woff2,application/vnd.ms-fontobject,application/font-sfnt,application/vnd.android.package-archive,binary/octet-stream,application/octet-stream,application/x-font-ttf,application/x-font-otf,video/webm,video/3gpp,application/font-ttf,audio/mp3,audio/x-wav,image/pjpeg,audio/basic,application/font-otf,application/x-ms-application,application/x-msdownload,video/x-ms-wmv,image/x-png,video/quicktime,image/x-ms-bmp,font/opentype,application/x-font-opentype,application/x-woff,audio/aiff,video/x-ms-asf,audio/x-ms-wma,audio/wma,application/x-mplayer2,image/avif"
 
 # Response code exclusions we will use to filter links and responses from web.archive.org through their API
 DEFAULT_FILTER_CODE = "404,301,302"
@@ -162,8 +297,11 @@ FILTER_KEYWORDS = ""
 URLSCAN_API_KEY = ""
 CONTINUE_RESPONSES_IF_PIPED = True
 WEBHOOK_DISCORD = ""
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
 DEFAULT_OUTPUT_DIR = ""
 INTELX_API_KEY = ""
+SOURCE_IP = None
 
 API_KEY_SECRET = "aHR0cHM6Ly95b3V0dS5iZS9kUXc0dzlXZ1hjUQ=="
 
@@ -184,6 +322,298 @@ INLINE_JS_EXCLUDE = [
     ".rar",
     ".json",
 ]
+
+# Binary file extensions that should be saved as raw bytes, not text
+BINARY_EXTENSIONS = frozenset(
+    [
+        ".zip",
+        ".gz",
+        ".gzip",
+        ".tar",
+        ".rar",
+        ".7z",
+        ".bz2",
+        ".xz",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".exe",
+        ".msi",
+        ".dll",
+        ".bin",
+        ".so",
+        ".dmg",
+        ".deb",
+        ".rpm",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".ico",
+        ".webp",
+        ".svg",
+        ".tiff",
+        ".tif",
+        ".mp3",
+        ".mp4",
+        ".wav",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".flv",
+        ".wmv",
+        ".webm",
+        ".ogg",
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        ".eot",
+        ".class",
+        ".jar",
+        ".war",
+        ".ear",
+        ".pyc",
+        ".pyo",
+        ".o",
+        ".a",
+        ".lib",
+        ".iso",
+        ".img",
+        ".sqlite",
+        ".db",
+        ".mdb",
+        ".swf",
+        ".fla",
+    ]
+)
+
+# Binary MIME types that should be saved as raw bytes, not text
+BINARY_MIME_TYPES = frozenset(
+    [
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/x-gzip",
+        "application/gzip",
+        "application/x-tar",
+        "application/x-rar-compressed",
+        "application/x-7z-compressed",
+        "application/x-bzip2",
+        "application/x-xz",
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/x-msdownload",
+        "application/x-msi",
+        "application/x-dosexec",
+        "application/octet-stream",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/bmp",
+        "image/x-icon",
+        "image/webp",
+        "image/tiff",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/ogg",
+        "audio/webm",
+        "video/mp4",
+        "video/avi",
+        "video/quicktime",
+        "video/x-msvideo",
+        "video/x-matroska",
+        "video/webm",
+        "video/ogg",
+        "font/ttf",
+        "font/otf",
+        "font/woff",
+        "font/woff2",
+        "application/x-font-ttf",
+        "application/x-font-otf",
+        "application/font-woff",
+        "application/font-woff2",
+        "application/java-archive",
+        "application/x-java-class",
+        "application/x-shockwave-flash",
+        "application/x-sqlite3",
+        "application/x-iso9660-image",
+    ]
+)
+
+
+def isBinaryContent(contentBytes, contentType, url=""):
+    """
+    Determine if content should be treated as binary based on actual content, Content-Type, and URL.
+
+    Priority (highest to lowest):
+    1. Content inspection - check for text signatures (most reliable)
+    2. Content-Type header
+    3. URL extension (least reliable - archive might have captured an HTML error page)
+
+    Args:
+        contentBytes: The raw response bytes (at least first 100 bytes)
+        contentType: The Content-Type header value
+        url: The URL (optional, used as fallback)
+
+    Returns True if content is binary and should be saved as raw bytes.
+    """
+    # STEP 1: Check actual content for text signatures (most reliable)
+    # If content starts with text markers, it's definitely NOT binary regardless of extension
+    try:
+        if contentBytes and len(contentBytes) > 0:
+            # Get first 100 bytes and strip leading whitespace/newlines for checking
+            preview = contentBytes[:100].lstrip()
+            previewLower = preview.lower()
+
+            # Common text file signatures
+            textSignatures = [
+                b"<!doctype",  # HTML doctype
+                b"<html",  # HTML tag
+                b"<head",  # HTML head
+                b"<body",  # HTML body
+                b"<?xml",  # XML declaration
+                b"<svg",  # SVG image (actually XML text)
+                b"{",  # JSON object
+                b"[",  # JSON array
+                b"/*",  # CSS/JS comment
+                b"//",  # JS comment
+                b"#!",  # Shebang (shell scripts)
+                b"var ",  # JavaScript
+                b"let ",  # JavaScript
+                b"const ",  # JavaScript
+                b"function",  # JavaScript
+                b"import ",  # JavaScript/Python
+                b"export ",  # JavaScript
+                b"class ",  # Various languages
+                b"def ",  # Python
+            ]
+
+            for sig in textSignatures:
+                if previewLower.startswith(sig):
+                    return False  # Definitely text, not binary
+
+            # Check for binary file magic bytes (file signatures)
+            binarySignatures = [
+                b"%PDF",  # PDF
+                b"PK\x03\x04",  # ZIP, DOCX, XLSX, etc.
+                b"PK\x05\x06",  # Empty ZIP
+                b"\x1f\x8b",  # GZIP
+                b"\x89PNG",  # PNG
+                b"\xff\xd8\xff",  # JPEG
+                b"GIF87a",  # GIF
+                b"GIF89a",  # GIF
+                b"BM",  # BMP (check at start)
+                b"RIFF",  # WAV, AVI, WebP
+                b"\x00\x00\x00",  # Various binary formats (MP4, etc.)
+                b"ID3",  # MP3 with ID3 tag
+                b"\xff\xfb",  # MP3
+                b"\xff\xfa",  # MP3
+                b"OggS",  # OGG
+                b"\x4d\x5a",  # EXE/DLL (MZ header)
+                b"\x7fELF",  # Linux ELF binary
+                b"\xca\xfe\xba\xbe",  # Java class file
+                b"\x30\x26\xb2\x75",  # ASF/WMV/WMA (first 4 bytes of ASF GUID)
+                b"FLV\x01",  # FLV (Flash Video)
+                b"ftyp",  # MP4/M4A/MOV (after 4 byte size prefix)
+                b"Rar!\x1a\x07",  # RAR archive
+                b"7z\xbc\xaf\x27\x1c",  # 7-Zip archive
+                b"\x1a\x45\xdf\xa3",  # WebM/MKV (EBML)
+                b"II\x2a\x00",  # TIFF (Intel byte order)
+                b"MM\x00\x2a",  # TIFF (Motorola byte order)
+                b"\x00\x00\x01\x00",  # ICO (Windows Icon)
+                b"\x00\x00\x02\x00",  # CUR (Windows Cursor)
+                b"wOFF",  # WOFF font
+                b"wOF2",  # WOFF2 font
+                b"FWS",  # SWF (uncompressed Flash)
+                b"CWS",  # SWF (zlib compressed Flash)
+                b"ZWS",  # SWF (LZMA compressed Flash)
+                b"\x00\x01\x00\x00",  # TrueType font
+                b"OTTO",  # OpenType font with CFF
+            ]
+
+            for sig in binarySignatures:
+                if preview.startswith(sig):
+                    return True  # Definitely binary
+    except Exception:
+        pass
+
+    # STEP 2: Check Content-Type header
+    try:
+        if contentType:
+            mimeType = contentType.lower().split(";")[0].strip()
+
+            # Explicit text types
+            textMimeTypes = [
+                "text/html",
+                "text/plain",
+                "text/css",
+                "text/javascript",
+                "text/xml",
+                "text/csv",
+                "text/markdown",
+                "application/json",
+                "application/javascript",
+                "application/xml",
+                "application/xhtml+xml",
+                "application/rss+xml",
+                "application/atom+xml",
+            ]
+            if mimeType in textMimeTypes or mimeType.startswith("text/"):
+                return False  # Text type
+
+            # Known binary types
+            if mimeType in BINARY_MIME_TYPES:
+                return True
+
+            # Generic binary prefixes
+            if (
+                mimeType.startswith("image/")
+                or mimeType.startswith("audio/")
+                or mimeType.startswith("video/")
+            ):
+                return True
+            if mimeType.startswith("application/") and mimeType not in textMimeTypes:
+                # application/* is often binary, but not always - be conservative
+                if "octet-stream" in mimeType or "binary" in mimeType:
+                    return True
+    except Exception:
+        pass
+
+    # STEP 3: Check URL extension as last resort
+    try:
+        if url:
+            # Extract actual URL from prefixed formats (Wayback/URLScan)
+            actualUrl = url
+            httpPos = url.find("http://")
+            httpsPos = url.find("https://")
+            if httpsPos >= 0:
+                actualUrl = url[httpsPos:]
+            elif httpPos >= 0:
+                actualUrl = url[httpPos:]
+
+            parsed = urlparse(actualUrl.strip())
+            path = parsed.path.lower()
+            if "." in path:
+                ext = "." + path.rsplit(".", 1)[-1]
+                if "?" in ext:
+                    ext = ext.split("?")[0]
+                if ext in BINARY_EXTENSIONS:
+                    return True
+    except Exception:
+        pass
+
+    # Default: treat as text (safer - text processing won't corrupt text)
+    return False
 
 
 # Get memory usage for
@@ -237,8 +667,7 @@ def write(text="", pipe=False):
     # or if the tool has been piped and the pipe parameter is True
     # AND if --stream is NOT active OR if it is active but we are explicitly piping (e.g. for URLs)
     if (sys.stdout.isatty() or (not sys.stdout.isatty() and pipe)) and (
-        not (args.stream and args.mode == "U")
-        or (args.stream and args.mode == "U" and pipe)
+        not (args.stream and args.mode == "U") or (args.stream and args.mode == "U" and pipe)
     ):
         # If it has carriage return in the string, don't add a newline
         if text.find("\r") > 0:
@@ -267,33 +696,26 @@ def writerr(text="", pipe=False):
 
 
 def showVersion():
+    global HTTP_ADAPTER
     try:
         try:
-            resp = requests.get(
+            session = TimeoutSession()
+            if HTTP_ADAPTER is not None:
+                session.mount("https://", HTTP_ADAPTER)
+                session.mount("http://", HTTP_ADAPTER)
+            resp = session.get(
                 "https://raw.githubusercontent.com/xnl-h4ck3r/waymore/main/waymore/__init__.py",
                 timeout=3,
             )
         except Exception:
-            write(
-                "Current waymore version "
-                + __version__
-                + " (unable to check if latest)\n"
-            )
+            write("Current waymore version " + __version__ + " (unable to check if latest)\n")
         if __version__ == resp.text.split("=")[1].replace('"', "").strip():
             write(
-                "Current waymore version "
-                + __version__
-                + " ("
-                + colored("latest", "green")
-                + ")\n"
+                "Current waymore version " + __version__ + " (" + colored("latest", "green") + ")\n"
             )
         else:
             write(
-                "Current waymore version "
-                + __version__
-                + " ("
-                + colored("outdated", "red")
-                + ")\n"
+                "Current waymore version " + __version__ + " (" + colored("outdated", "red") + ")\n"
             )
     except Exception:
         pass
@@ -307,9 +729,7 @@ def showBanner():
     write(colored("| | | / ___ | |_| ", "red") + "| | | | |_| | |   | |_| |")
     write(colored(r" \___/\_____|\__  ", "red") + r"|_|_|_|\___/| |   | ____/")
     write(
-        colored("            (____/ ", "red")
-        + colored("  by Xnl-h4ck3r ", "magenta")
-        + r" \_____)"
+        colored("            (____/ ", "red") + colored("  by Xnl-h4ck3r ", "magenta") + r" \_____)"
     )
     try:
         currentDate = datetime.now().date()
@@ -322,11 +742,7 @@ def showBanner():
                 )
             )
         elif currentDate.month == 10 and currentDate.day == 31:
-            write(
-                colored(
-                    "            *** 🎃 HAPPY HALLOWEEN! 🎃 ***", "red", attrs=["blink"]
-                )
-            )
+            write(colored("            *** 🎃 HAPPY HALLOWEEN! 🎃 ***", "red", attrs=["blink"]))
         elif currentDate.month == 1 and currentDate.day in (1, 2, 3, 4, 5):
             write(
                 colored(
@@ -353,16 +769,14 @@ def handler(signal_received, frame):
     This function is called if Ctrl-C is called by the user
     An attempt will be made to try and clean up properly
     """
-    global stopSource, stopProgram, stopProgramCount
+    global stopSource, stopProgram, stopProgramCount, stopSourceWayback, stopSourceCommonCrawl, stopSourceAlienVault, stopSourceURLScan, stopSourceVirusTotal, stopSourceIntelx, stopSourceGhostArchive, current_response, current_session
 
     if stopProgram is not None:
         stopProgramCount = stopProgramCount + 1
         if stopProgramCount == 1:
             writerr(
                 colored(
-                    getSPACER(
-                        ">>> Please be patient... Trying to save data and end gracefully!"
-                    ),
+                    getSPACER(">>> Please be patient... Trying to save data and end gracefully!"),
                     "red",
                 )
             )
@@ -384,24 +798,49 @@ def handler(signal_received, frame):
     else:
         stopProgram = StopProgram.SIGINT
         stopSource = True
+        stopSourceWayback = True
+        stopSourceCommonCrawl = True
+        stopSourceAlienVault = True
+        stopSourceURLScan = True
+        stopSourceVirusTotal = True
+        stopSourceIntelx = True
+        stopSourceGhostArchive = True
+        # Try to close any active response or session to interrupt blocking network I/O
+        try:
+            if current_response is not None:
+                try:
+                    current_response.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if current_session is not None:
+                try:
+                    current_session.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Signal any waits to stop early
+        try:
+            interrupt_event.set()
+        except Exception:
+            pass
         writerr(
             colored(
                 getSPACER('>>> "Oh my God, they killed Kenny... and waymore!" - Kyle'),
                 "red",
             )
         )
-        writerr(
-            colored(
-                getSPACER(">>> Attempting to rescue any data gathered so far..."), "red"
-            )
-        )
+        writerr(colored(getSPACER(">>> Attempting to rescue any data gathered so far..."), "red"))
 
 
 def showOptions():
     """
     Show the chosen options and config settings
     """
-    global inputIsDomainANDPath, argsInput, isInputFile, INTELX_API_KEY
+    global inputIsDomainANDPath, argsInput, isInputFile, INTELX_API_KEY, SOURCE_IP
 
     try:
         write(colored("Selected config and settings:", "cyan"))
@@ -479,13 +918,13 @@ def showOptions():
         )
 
         if not args.xcc:
-            if args.lcc == 0 and args.lcy == 0:
+            if args.lcc == 0 and args.from_date is None and args.to_date is None:
                 write(
                     colored("-lcc: " + str(args.lcc), "magenta")
                     + colored(" Search ALL Common Crawl index collections.", "white")
                 )
             else:
-                if args.lcy == 0:
+                if args.from_date is None and args.to_date is None:
                     write(
                         colored("-lcc: " + str(args.lcc), "magenta")
                         + colored(
@@ -498,19 +937,10 @@ def showOptions():
                         write(
                             colored("-lcc: " + str(args.lcc), "magenta")
                             + colored(
-                                " The number of latest Common Crawl index collections to be searched.",
+                                " The number of latest Common Crawl index collections to be searched within the specified date range (-to and -from).",
                                 "white",
                             )
                         )
-                    write(
-                        colored("-lcy: " + str(args.lcy), "magenta")
-                        + colored(
-                            " Search all Common Crawl index collections with data from year "
-                            + str(args.lcy)
-                            + " and after.",
-                            "white",
-                        )
-                    )
 
         if URLSCAN_API_KEY == "":
             write(
@@ -532,22 +962,18 @@ def showOptions():
                 )
             )
         else:
-            write(
-                colored("VirusTotal API Key: ", "magenta") + colored(VIRUSTOTAL_API_KEY)
-            )
+            write(colored("VirusTotal API Key: ", "magenta") + colored(VIRUSTOTAL_API_KEY))
 
         if INTELX_API_KEY == "":
             write(
                 colored("Intelligence X API Key:", "magenta")
                 + colored(
-                    " {none} - You require a paid API Key from https://intelx.io/product",
+                    " {none} - You require a Academia or Paid API Key from https://intelx.io/product",
                     "white",
                 )
             )
         else:
-            write(
-                colored("Intelligence X API Key: ", "magenta") + colored(INTELX_API_KEY)
-            )
+            write(colored("Intelligence X API Key: ", "magenta") + colored(INTELX_API_KEY))
 
         if args.mode in ["U", "B"]:
             if args.output_urls != "":
@@ -589,9 +1015,7 @@ def showOptions():
                     write(
                         colored("-l: " + str(args.limit), "magenta")
                         + colored(
-                            " Only save the FIRST "
-                            + str(args.limit)
-                            + " responses found.",
+                            " Only save the FIRST " + str(args.limit) + " responses found.",
                             "white",
                         )
                     )
@@ -599,23 +1023,10 @@ def showOptions():
                     write(
                         colored("-l: " + str(args.limit), "magenta")
                         + colored(
-                            " Only save the LAST "
-                            + str(abs(args.limit))
-                            + " responses found.",
+                            " Only save the LAST " + str(abs(args.limit)) + " responses found.",
                             "white",
                         )
                     )
-
-            if args.from_date is not None:
-                write(
-                    colored("-from: " + str(args.from_date), "magenta")
-                    + colored(" The date/time to get responses from.", "white")
-                )
-            if args.to_date is not None:
-                write(
-                    colored("-to: " + str(args.to_date), "magenta")
-                    + colored(" The date/time to get responses up to.", "white")
-                )
 
             if args.capture_interval == "h":
                 write(
@@ -667,6 +1078,32 @@ def showOptions():
                 )
             )
 
+        if args.from_date is not None:
+            write(
+                colored("-from: " + str(args.from_date), "magenta")
+                + colored(
+                    " The date/time to get data from.",
+                    "white",
+                )
+                + colored(
+                    " NOTE: All results will still be returned from Intelligence X, and all sub domains from Virus Total, because these cannot be filtered by date.",
+                    "yellow",
+                )
+            )
+
+        if args.to_date is not None:
+            write(
+                colored("-to: " + str(args.to_date), "magenta")
+                + colored(
+                    " The date/time to get data up to.",
+                    "white",
+                )
+                + colored(
+                    " NOTE: All results will still be returned from Intelligence X, and all sub domains from Virus Total, because these cannot be filtered by date.",
+                    "yellow",
+                )
+            )
+
         write(
             colored("-f: " + str(args.filter_responses_only), "magenta")
             + colored(
@@ -705,9 +1142,7 @@ def showOptions():
                     )
                 )
         if not args.mc and args.fc:
-            write(
-                colored("Response Code exclusions: ", "magenta") + colored(FILTER_CODE)
-            )
+            write(colored("Response Code exclusions: ", "magenta") + colored(FILTER_CODE))
         write(colored("Response URL exclusions: ", "magenta") + colored(FILTER_URL))
 
         if args.mt:
@@ -771,14 +1206,27 @@ def showOptions():
                     )
                 )
             else:
-                write(
-                    colored("Discord Webhook: ", "magenta") + colored(WEBHOOK_DISCORD)
-                )
+                write(colored("Discord Webhook: ", "magenta") + colored(WEBHOOK_DISCORD))
 
-        write(
-            colored("Default Output Directory: ", "magenta")
-            + colored(str(DEFAULT_OUTPUT_DIR))
-        )
+        if args.notify_telegram:
+            if (
+                TELEGRAM_BOT_TOKEN == ""
+                or TELEGRAM_BOT_TOKEN == "YOUR_TOKEN"
+                or TELEGRAM_CHAT_ID == ""
+                or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID"
+            ):
+                write(
+                    colored("Telegram: ", "magenta")
+                    + colored(
+                        "It looks like Telegram Bot Token or Chat ID has not been set in config.yml file.",
+                        "red",
+                    )
+                )
+            else:
+                write(colored("Telegram Bot Token: ", "magenta") + colored(TELEGRAM_BOT_TOKEN))
+                write(colored("Telegram Chat ID: ", "magenta") + colored(TELEGRAM_CHAT_ID))
+
+        write(colored("Default Output Directory: ", "magenta") + colored(str(DEFAULT_OUTPUT_DIR)))
 
         if args.regex_after is not None:
             write(
@@ -799,7 +1247,7 @@ def showOptions():
         if args.mode in ["R", "B"] or (args.mode == "U" and not args.xcc):
             write(
                 colored("-p: " + str(args.processes), "magenta")
-                + colored(" The number of parallel requests made.", "white")
+                + colored(" The number of parallel requests made per source.", "white")
             )
         write(
             colored("-r: " + str(args.retries), "magenta")
@@ -826,6 +1274,13 @@ def showOptions():
                 )
             )
 
+        # Only show --source-ip if it's explicitly configured
+        if SOURCE_IP:
+            write(
+                colored("--source-ip: " + str(SOURCE_IP), "magenta")
+                + colored(" Outbound requests will bind to this IP.", "white")
+            )
+
         write()
 
     except Exception as e:
@@ -836,7 +1291,7 @@ def getConfig():
     """
     Try to get the values from the config file, otherwise use the defaults
     """
-    global FILTER_CODE, FILTER_MIME, FILTER_URL, FILTER_KEYWORDS, URLSCAN_API_KEY, VIRUSTOTAL_API_KEY, CONTINUE_RESPONSES_IF_PIPED, subs, path, waymorePath, inputIsDomainANDPath, HTTP_ADAPTER, HTTP_ADAPTER_CC, argsInput, terminalWidth, MATCH_CODE, WEBHOOK_DISCORD, DEFAULT_OUTPUT_DIR, MATCH_MIME, INTELX_API_KEY
+    global FILTER_CODE, FILTER_MIME, FILTER_URL, FILTER_KEYWORDS, URLSCAN_API_KEY, VIRUSTOTAL_API_KEY, CONTINUE_RESPONSES_IF_PIPED, subs, path, waymorePath, inputIsDomainANDPath, HTTP_ADAPTER, HTTP_ADAPTER_CC, argsInput, terminalWidth, MATCH_CODE, WEBHOOK_DISCORD, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DEFAULT_OUTPUT_DIR, MATCH_MIME, INTELX_API_KEY, SOURCE_IP
     try:
 
         # Set terminal width
@@ -864,64 +1319,62 @@ def getConfig():
         if args.no_subs or inputIsDomainANDPath:
             subs = ""
 
-        # Set up an HTTPAdaptor for retry strategy when making requests
-        try:
-            retry = Retry(
-                total=args.retries,
-                backoff_factor=1.1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                raise_on_status=False,
-                respect_retry_after_header=False,
-            )
-            HTTP_ADAPTER = HTTPAdapter(max_retries=retry)
-        except Exception as e:
-            writerr(colored("ERROR getConfig 2: " + str(e), "red"))
-
-        # Set up an HTTPAdaptor for retry strategy for Common Crawl when making requests
-        try:
-            retry = Retry(
-                total=args.retries + 3,
-                backoff_factor=1.1,
-                status_forcelist=[503],
-                raise_on_status=False,
-                respect_retry_after_header=False,
-            )
-            HTTP_ADAPTER_CC = HTTPAdapter(max_retries=retry)
-        except Exception as e:
-            writerr(colored("ERROR getConfig 3: " + str(e), "red"))
-
         # Try to get the config file values
         useDefaults = False
         try:
             # Get the path of the config file. If -c / --config argument is not passed, then it defaults to config.yml in the same directory as the run file
-            waymorePath = (
-                Path(os.path.join(os.getenv("APPDATA", ""), "waymore"))
-                if os.name == "nt"
-                else (
-                    Path(os.path.join(os.path.expanduser("~"), ".config", "waymore"))
-                    if os.name == "posix"
-                    else (
-                        Path(
-                            os.path.join(
-                                os.path.expanduser("~"),
-                                "Library",
-                                "Application Support",
-                                "waymore",
-                            )
-                        )
-                        if os.name == "darwin"
-                        else None
-                    )
-                )
-            )
-            waymorePath.absolute
+            if os.name == "nt":
+                waymorePath = Path(os.path.join(os.getenv("APPDATA", ""), "waymore"))
+            elif sys.platform == "darwin":
+                waymorePath = Path(os.path.expanduser("~/Library/Application Support/waymore"))
+            else:
+                waymorePath = Path(os.path.expanduser("~/.config/waymore"))
+
             if args.config is None:
-                if waymorePath == "":
-                    configPath = "config.yml"
-                else:
-                    configPath = Path(waymorePath / "config.yml")
+                configPath = waymorePath / "config.yml"
             else:
                 configPath = Path(args.config)
+
+            # If the config file doesn't exist, create the default one
+            if not os.path.isfile(configPath):
+                try:
+                    # Make sure the directory exists
+                    if configPath.parent != Path("."):
+                        os.makedirs(configPath.parent, exist_ok=True)
+                    # Create the default config content using the DEFAULT_* constants
+                    defaultConfig = f"""FILTER_CODE: {DEFAULT_FILTER_CODE}
+FILTER_MIME: {DEFAULT_FILTER_MIME}
+FILTER_URL: {DEFAULT_FILTER_URL}
+FILTER_KEYWORDS: {DEFAULT_FILTER_KEYWORDS}
+URLSCAN_API_KEY:
+VIRUSTOTAL_API_KEY:
+CONTINUE_RESPONSES_IF_PIPED: True
+WEBHOOK_DISCORD: YOUR_WEBHOOK
+TELEGRAM_BOT_TOKEN: YOUR_TOKEN
+TELEGRAM_CHAT_ID: YOUR_CHAT_ID
+DEFAULT_OUTPUT_DIR:
+INTELX_API_KEY:
+SOURCE_IP:
+"""
+                    with open(configPath, "w", encoding="utf-8") as f:
+                        f.write(defaultConfig)
+                    writerr(
+                        colored(
+                            'Config file not found - created default config at "'
+                            + str(configPath)
+                            + '"',
+                            "yellow",
+                        )
+                    )
+                except Exception as e:
+                    writerr(
+                        colored(
+                            "Config file not found, but failed to create default config file: "
+                            + str(e),
+                            "red",
+                        )
+                    )
+
             config = yaml.safe_load(open(configPath))
             try:
                 FILTER_URL = config.get("FILTER_URL")
@@ -1044,6 +1497,28 @@ def getConfig():
                 INTELX_API_KEY = ""
 
             try:
+                if args.source_ip:
+                    SOURCE_IP = args.source_ip
+                else:
+                    cfg_source_ip = config.get("SOURCE_IP")
+                    if str(cfg_source_ip) in ("None", "", "null"):
+                        SOURCE_IP = None
+                    else:
+                        try:
+                            ipaddress.ip_address(cfg_source_ip)
+                            SOURCE_IP = str(cfg_source_ip)
+                        except ValueError:
+                            writerr(
+                                colored(
+                                    'Invalid "SOURCE_IP" value in config.yml - ignoring and using default routing',
+                                    "yellow",
+                                )
+                            )
+                            SOURCE_IP = None
+            except Exception:
+                SOURCE_IP = args.source_ip
+
+            try:
                 FILTER_KEYWORDS = config.get("FILTER_KEYWORDS")
                 if str(FILTER_KEYWORDS) == "None":
                     writerr(
@@ -1084,10 +1559,7 @@ def getConfig():
             if args.notify_discord:
                 try:
                     WEBHOOK_DISCORD = config.get("WEBHOOK_DISCORD")
-                    if (
-                        str(WEBHOOK_DISCORD) == "None"
-                        or str(WEBHOOK_DISCORD) == "YOUR_WEBHOOK"
-                    ):
+                    if str(WEBHOOK_DISCORD) == "None" or str(WEBHOOK_DISCORD) == "YOUR_WEBHOOK":
                         writerr(
                             colored(
                                 'No value for "WEBHOOK_DISCORD" in config.yml - default set',
@@ -1103,6 +1575,45 @@ def getConfig():
                         )
                     )
                     WEBHOOK_DISCORD = ""
+
+            if args.notify_telegram:
+                try:
+                    TELEGRAM_BOT_TOKEN = config.get("TELEGRAM_BOT_TOKEN")
+                    if str(TELEGRAM_BOT_TOKEN) == "None" or str(TELEGRAM_BOT_TOKEN) == "YOUR_TOKEN":
+                        writerr(
+                            colored(
+                                'No value for "TELEGRAM_BOT_TOKEN" in config.yml - default set',
+                                "yellow",
+                            )
+                        )
+                        TELEGRAM_BOT_TOKEN = ""
+                except Exception:
+                    writerr(
+                        colored(
+                            'Unable to read "TELEGRAM_BOT_TOKEN" from config.yml - default set',
+                            "red",
+                        )
+                    )
+                    TELEGRAM_BOT_TOKEN = ""
+
+                try:
+                    TELEGRAM_CHAT_ID = config.get("TELEGRAM_CHAT_ID")
+                    if str(TELEGRAM_CHAT_ID) == "None" or str(TELEGRAM_CHAT_ID) == "YOUR_CHAT_ID":
+                        writerr(
+                            colored(
+                                'No value for "TELEGRAM_CHAT_ID" in config.yml - default set',
+                                "yellow",
+                            )
+                        )
+                        TELEGRAM_CHAT_ID = ""
+                except Exception:
+                    writerr(
+                        colored(
+                            'Unable to read "TELEGRAM_CHAT_ID" from config.yml - default set',
+                            "red",
+                        )
+                    )
+                    TELEGRAM_CHAT_ID = ""
 
             try:
                 DEFAULT_OUTPUT_DIR = config.get("DEFAULT_OUTPUT_DIR")
@@ -1164,9 +1675,7 @@ def getConfig():
             else:
                 writerr(
                     colored(
-                        'WARNING: Cannot find file "'
-                        + args.config
-                        + '", so using default values',
+                        'WARNING: Cannot find file "' + args.config + '", so using default values',
                         "yellow",
                     )
                 )
@@ -1205,7 +1714,41 @@ def getConfig():
             FILTER_KEYWORDS = ""
             CONTINUE_RESPONSES_IF_PIPED = True
             WEBHOOK_DISCORD = ""
+            TELEGRAM_BOT_TOKEN = ""
+            TELEGRAM_CHAT_ID = ""
             DEFAULT_OUTPUT_DIR = os.path.expanduser("~/.config/waymore")
+            SOURCE_IP = args.source_ip
+
+        # Build HTTP adapters (after SOURCE_IP is resolved)
+        try:
+            retry = Retry(
+                total=args.retries,
+                backoff_factor=1.1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                raise_on_status=False,
+                respect_retry_after_header=False,
+            )
+            if SOURCE_IP:
+                HTTP_ADAPTER = SourceAddressAdapter(source_ip=SOURCE_IP, max_retries=retry)
+            else:
+                HTTP_ADAPTER = HTTPAdapter(max_retries=retry)
+        except Exception as e:
+            writerr(colored("ERROR getConfig 2: " + str(e), "red"))
+
+        try:
+            retry_cc = Retry(
+                total=args.retries + 3,
+                backoff_factor=1.1,
+                status_forcelist=[503],
+                raise_on_status=False,
+                respect_retry_after_header=False,
+            )
+            if SOURCE_IP:
+                HTTP_ADAPTER_CC = SourceAddressAdapter(source_ip=SOURCE_IP, max_retries=retry_cc)
+            else:
+                HTTP_ADAPTER_CC = HTTPAdapter(max_retries=retry_cc)
+        except Exception as e:
+            writerr(colored("ERROR getConfig 3: " + str(e), "red"))
 
     except Exception as e:
         writerr(colored("ERROR getConfig 1: " + str(e), "red"))
@@ -1238,9 +1781,7 @@ def printProgressBar(
     if not (args.stream and args.mode == "U"):
         try:
             percent = (
-                ("{0:." + str(decimals) + "f}")
-                .format(100 * (iteration / float(total)))
-                .rjust(5)
+                ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total))).rjust(5)
             )
             filledLength = int(length * iteration // total)
             bar = fill * filledLength + "-" * (length - filledLength)
@@ -1263,11 +1804,15 @@ def printProgressBar(
 
 def filehash(text):
     """
-    Generate a hash value for the passed string. This is used for the file name of a downloaded archived response
+    Generate a hash value for the passed string or bytes. This is used for the file name of a downloaded archived response
     """
     hash = 0
     for ch in text:
-        hash = (hash * 281 ^ ord(ch) * 997) & 0xFFFFFFFFFFF
+        # Handle both str (gives chars needing ord()) and bytes (gives ints directly)
+        if isinstance(ch, int):
+            hash = (hash * 281 ^ ch * 997) & 0xFFFFFFFFFFF
+        else:
+            hash = (hash * 281 ^ ord(ch) * 997) & 0xFFFFFFFFFFF
     return str(hash)
 
 
@@ -1295,9 +1840,66 @@ def fixArchiveOrgUrl(url):
     return url
 
 
+def isLikelyBinaryUrl(url):
+    """
+    Check if a URL likely points to a binary file based on its extension.
+    This is used BEFORE making a request to decide if we need the raw/id_ version.
+    """
+    try:
+        # Extract actual URL from prefixed formats (Wayback timestamp/URLScan UUID)
+        actualUrl = url
+        httpPos = url.find("http://")
+        httpsPos = url.find("https://")
+        if httpsPos >= 0:
+            actualUrl = url[httpsPos:]
+        elif httpPos >= 0:
+            actualUrl = url[httpPos:]
+
+        parsed = urlparse(actualUrl.strip())
+        path = parsed.path.lower()
+        if "." in path:
+            ext = "." + path.rsplit(".", 1)[-1]
+            if "?" in ext:
+                ext = ext.split("?")[0]
+            if ext in BINARY_EXTENSIONS:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def addRawModifier(archiveUrl):
+    """
+    Add 'id_' modifier to Wayback Machine URL to get raw/original content.
+    This is essential for binary files to avoid Wayback modifications.
+
+    Example:
+      Input:  https://web.archive.org/web/20090315210455/http://example.com/file.wmv
+      Output: https://web.archive.org/web/20090315210455id_/http://example.com/file.wmv
+    """
+    try:
+        # Find the timestamp in the URL (14 digits after /web/)
+        webPos = archiveUrl.find("/web/")
+        if webPos >= 0:
+            # Find where the timestamp ends (first / after /web/)
+            afterWeb = webPos + 5  # Position after "/web/"
+            slashAfterTimestamp = archiveUrl.find("/", afterWeb)
+            if slashAfterTimestamp > afterWeb:
+                # Insert id_ before the slash after timestamp
+                timestamp = archiveUrl[afterWeb:slashAfterTimestamp]
+                # Only add id_ if it's not already there
+                if not timestamp.endswith("id_"):
+                    return (
+                        archiveUrl[:slashAfterTimestamp] + "id_" + archiveUrl[slashAfterTimestamp:]
+                    )
+    except Exception:
+        pass
+    return archiveUrl
+
+
 # Add a link to the linksFound collection for archived responses (included timestamp preifx)
 def linksFoundResponseAdd(link):
-    global linksFound, argsInput, argsInputHostname
+    global linksFound, argsInput, argsInputHostname, links_lock
 
     try:
         if inputIsDomainANDPath:
@@ -1317,21 +1919,24 @@ def linksFoundResponseAdd(link):
             parsed_url = linkWithoutTimestamp
 
         # Don't write it if the link does not contain the requested domain (this can sometimes happen)
-        if parsed_url.lower().find(checkInput.lower()) >= 0:
-            linksFound.add(link)
+        # Use URL decoding to handle %20 spaces and case-insensitive comparison
+        if unquote(parsed_url).lower().find(unquote(checkInput).lower()) >= 0:
+            with links_lock:
+                linksFound.add(link)
             # If streaming is enabled and mode is 'U', print the link to stdout
             if args.stream and args.mode == "U":
                 write(link, pipe=True)
     except Exception:
-        linksFound.add(link)
+        with links_lock:
+            linksFound.add(link)
         # If streaming is enabled and mode is 'U', print the link to stdout
         if args.stream and args.mode == "U":
             write(link, pipe=True)
 
 
 # Add a link to the linksFound collection
-def linksFoundAdd(link):
-    global linksFound, argsInput, argsInputHostname
+def linksFoundAdd(link, source_set=None):
+    global linksFound, argsInput, argsInputHostname, links_lock
 
     try:
         if inputIsDomainANDPath:
@@ -1348,13 +1953,22 @@ def linksFoundAdd(link):
             parsed_url = link
 
         # Don't write it if the link does not contain the requested domain (this can sometimes happen)
-        if parsed_url.find(checkInput) >= 0:
-            linksFound.add(link)
+        # Use URL decoding to handle %20 spaces and case-insensitive comparison
+        if unquote(parsed_url).lower().find(unquote(checkInput).lower()) >= 0:
+            with links_lock:
+                if source_set is not None:
+                    source_set.add(link)
+                else:
+                    linksFound.add(link)
             # If streaming is enabled and mode is 'U', print the link to stdout
             if args.stream and args.mode == "U":
                 write(link, pipe=True)
     except Exception:
-        linksFound.add(link)
+        with links_lock:
+            if source_set is not None:
+                source_set.add(link)
+            else:
+                linksFound.add(link)
         # If streaming is enabled and mode is 'U', print the link to stdout
         if args.stream and args.mode == "U":
             write(link, pipe=True)
@@ -1369,6 +1983,12 @@ def processArchiveUrl(url):
         if stopProgram is None:
 
             archiveUrl = "https://web.archive.org/web/" + fixArchiveOrgUrl(url)
+
+            # For binary files, add id_ modifier to get raw/original content
+            # This prevents Wayback Machine from modifying the content
+            if isLikelyBinaryUrl(url):
+                archiveUrl = addRawModifier(archiveUrl)
+
             hashValue = ""
 
             # Get memory usage every 100 responses
@@ -1381,10 +2001,22 @@ def processArchiveUrl(url):
             # Make a request to the web archive
             try:
                 try:
+                    try:
+                        if verbose() and os.environ.get("USER") == "xnl":
+                            writerr(
+                                colored(
+                                    "[ DBG ] Requesting file " + archiveUrl,
+                                    "yellow",
+                                    attrs=["dark"],
+                                )
+                            )
+                    except Exception:
+                        pass
+
                     # Choose a random user agent string to use for any requests
                     userAgent = random.choice(USER_AGENT)
 
-                    session = requests.Session()
+                    session = TimeoutSession()
                     session.mount("https://", HTTP_ADAPTER)
                     session.mount("http://", HTTP_ADAPTER)
                     resp = session.get(
@@ -1392,153 +2024,175 @@ def processArchiveUrl(url):
                         headers={"User-Agent": userAgent},
                         allow_redirects=True,
                     )
-                    archiveHtml = str(resp.text)
+
+                    # Get raw content bytes first
+                    contentBytes = resp.content
+
                     try:
-                        contentType = (
-                            resp.headers.get("Content-Type").split(";")[0].lower()
-                        )
+                        contentType = resp.headers.get("Content-Type", "").split(";")[0].lower()
                     except Exception:
                         contentType = ""
 
-                    # Only create a file if there is a response
-                    if len(archiveHtml) != 0:
+                    # Determine if this is binary content based on actual content, Content-Type, and URL
+                    isBinary = isBinaryContent(contentBytes, contentType, url)
 
+                    if isBinary:
+                        # For binary files, use raw bytes as-is
+                        archiveContent = contentBytes
+                        archiveHtml = None  # Not used for binary files
+                    else:
+                        # For text files, decode to string
+                        archiveHtml = contentBytes.decode("utf-8", errors="replace")
+                        archiveContent = None  # Not used for text files
+
+                    # Only create a file if there is a response
+                    responseLength = len(archiveContent) if isBinary else len(archiveHtml)
+                    if responseLength != 0:
+
+                        # For text files, check for custom 404 pages
                         # If the FILTER_CODE doesn't include 404, OR
                         # If the FILTER_CODE includes 404, and it doesn't seem to be a custom 404 page
-                        if "404" not in FILTER_CODE or (
-                            "404" in FILTER_CODE
-                            and not re.findall(
-                                REGEX_404, archiveHtml, re.DOTALL | re.IGNORECASE
+                        if (
+                            isBinary
+                            or "404" not in FILTER_CODE
+                            or (
+                                "404" in FILTER_CODE
+                                and not re.findall(
+                                    REGEX_404, archiveHtml, re.DOTALL | re.IGNORECASE
+                                )
                             )
                         ):
 
-                            # Add the URL as a comment at the start of the response
-                            if args.url_filename:
-                                archiveHtml = (
-                                    "/* Original URL: "
-                                    + archiveUrl
-                                    + " */\n"
-                                    + archiveHtml
+                            # For text files only: Add URL comment and clean up wayback references
+                            if not isBinary:
+                                # Add the URL as a comment at the start of the response
+                                if args.url_filename:
+                                    archiveHtml = (
+                                        "/* Original URL: " + archiveUrl + " */\n" + archiveHtml
+                                    )
+
+                                # Remove all web archive references in the response
+                                archiveHtml = re.sub(
+                                    r'\<script type=\"text\/javascript" src=\"\/_static\/js\/bundle-playback\.js\?v=[A-Za-z0-9]*" charset="utf-8"\><\/script>\n<script type="text\/javascript" src="\/_static\/js\/wombat\.js.*\<\!-- End Wayback Rewrite JS Include --\>',
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<script src=\"\/\/archive\.org.*\<\!-- End Wayback Rewrite JS Include --\>",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<script\>window\.RufflePlayer[^\<]*\<\/script\>",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<\!-- BEGIN WAYBACK TOOLBAR INSERT --\>.*\<\!-- END WAYBACK TOOLBAR INSERT --\>",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"(}\n)?(\/\*|<\!--\n)\s*FILE ARCHIVED ON.*108\(a\)\(3\)\)\.\n(\*\/|--\>)",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"var\s_____WB\$wombat\$assign\$function.*WB\$wombat\$assign\$function_____\(\"opener\"\);",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"(\<\!--|\/\*)\nplayback timings.*(--\>|\*\/)",
+                                    "",
+                                    archiveHtml,
+                                    1,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"((https:)?\/\/web\.archive\.org)?\/web\/[0-9]{14}([A-Za-z]{2}\_)?\/",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"((https:)?\\\/\\\/web\.archive\.org)?\\\/web\\\/[0-9]{14}([A-Za-z]{2}\_)?\\\/",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"((https:)?%2F%2Fweb\.archive\.org)?%2Fweb%2F[0-9]{14}([A-Za-z]{2}\_)?%2F",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"((https:)?\\u002F\\u002Fweb\.archive\.org)?\\u002Fweb\\u002F[0-9]{14}([A-Za-z]{2}\_)?\\u002F",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<script type=\"text\/javascript\"\>\s*__wm\.init\(\"https:\/\/web\.archive\.org\/web\"\);[^\<]*\<\/script\>",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r'\<script type=\"text\/javascript\" src="https:\/\/web-static\.archive\.org[^\<]*\<\/script\>',
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<link rel=\"stylesheet\" type=\"text\/css\" href=\"https:\/\/web-static\.archive\.org[^\<]*\/\>",
+                                    "",
+                                    archiveHtml,
+                                    flags=re.IGNORECASE,
+                                )
+                                archiveHtml = re.sub(
+                                    r"\<\!-- End Wayback Rewrite JS Include --\>",
+                                    "",
+                                    archiveHtml,
+                                    re.IGNORECASE,
                                 )
 
-                            # Remove all web archive references in the response
-                            archiveHtml = re.sub(
-                                r'\<script type=\"text\/javascript" src=\"\/_static\/js\/bundle-playback\.js\?v=[A-Za-z0-9]*" charset="utf-8"><\/script>\n<script type="text\/javascript" src="\/_static\/js\/wombat\.js.*\<\!-- End Wayback Rewrite JS Include --\>',
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<script src=\"\/\/archive\.org.*\<\!-- End Wayback Rewrite JS Include --\>",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<script\>window\.RufflePlayer[^\<]*\<\/script\>",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<\!-- BEGIN WAYBACK TOOLBAR INSERT --\>.*\<\!-- END WAYBACK TOOLBAR INSERT --\>",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"(}\n)?(\/\*|<!--\n)\s*FILE ARCHIVED ON.*108\(a\)\(3\)\)\.\n(\*\/|-->)",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"var\s_____WB\$wombat\$assign\$function.*WB\$wombat\$assign\$function_____\(\"opener\"\);",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"(\<\!--|\/\*)\nplayback timings.*(--\>|\*\/)",
-                                "",
-                                archiveHtml,
-                                1,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"((https:)?\/\/web\.archive\.org)?\/web\/[0-9]{14}([A-Za-z]{2}\_)?\/",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"((https:)?\\\/\\\/web\.archive\.org)?\\\/web\\\/[0-9]{14}([A-Za-z]{2}\_)?\\\/",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"((https:)?%2F%2Fweb\.archive\.org)?%2Fweb%2F[0-9]{14}([A-Za-z]{2}\_)?%2F",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"((https:)?\\u002F\\u002Fweb\.archive\.org)?\\u002Fweb\\u002F[0-9]{14}([A-Za-z]{2}\_)?\\u002F",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<script type=\"text\/javascript\">\s*__wm\.init\(\"https:\/\/web\.archive\.org\/web\"\);[^\<]*\<\/script\>",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r'\<script type=\"text\/javascript\" src="https:\/\/web-static\.archive\.org[^\<]*\<\/script\>',
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<link rel=\"stylesheet\" type=\"text\/css\" href=\"https:\/\/web-static\.archive\.org[^\<]*\/\>",
-                                "",
-                                archiveHtml,
-                                flags=re.IGNORECASE,
-                            )
-                            archiveHtml = re.sub(
-                                r"\<\!-- End Wayback Rewrite JS Include --\>",
-                                "",
-                                archiveHtml,
-                                re.IGNORECASE,
-                            )
-
-                            # If there is a specific Wayback error in the response, raise an exception
-                            if (
-                                archiveHtml.lower().find(
-                                    "wayback machine has not archived that url"
-                                )
-                                > 0
-                                or archiveHtml.lower().find(
-                                    "snapshot cannot be displayed due to an internal error"
-                                )
-                                > 0
-                            ):
-                                raise WayBackException
+                                # If there is a specific Wayback error in the response, raise an exception
+                                if (
+                                    archiveHtml.lower().find(
+                                        "wayback machine has not archived that url"
+                                    )
+                                    > 0
+                                    or archiveHtml.lower().find(
+                                        "snapshot cannot be displayed due to an internal error"
+                                    )
+                                    > 0
+                                ):
+                                    raise WayBackException
 
                             # Create file name based on url or hash value of the response, depending on selection. Ensure the file name isn't over 255 characters
                             if args.url_filename:
                                 fileName = url.replace("/", "-").replace(":", "")
                                 fileName = fileName[0:254]
                             else:
-                                hashValue = filehash(archiveHtml)
+                                # For binary files, hash the raw bytes; for text, hash the text
+                                if isBinary:
+                                    hashValue = filehash(archiveContent.hex())
+                                else:
+                                    hashValue = filehash(archiveHtml)
                                 fileName = hashValue
 
                                 # Determine extension of file from the content-type using the mimetypes library
@@ -1565,9 +2219,7 @@ def processArchiveUrl(url):
                                     # Determine the extension from the content type
                                     try:
                                         if contentType != "":
-                                            extension = contentType.split("/")[
-                                                1
-                                            ].replace("x-", "")
+                                            extension = contentType.split("/")[1].replace("x-", "")
                                         if extension == "":
                                             extension = contentType.lower()
                                     except Exception:
@@ -1582,25 +2234,31 @@ def processArchiveUrl(url):
                                         extension = "css"
                                     elif "pdf" in extension:
                                         extension = "pdf"
+                                    elif "zip" in extension:
+                                        extension = "zip"
+                                    elif "gzip" in extension or "x-gzip" in extension:
+                                        extension = "gz"
                                     elif "plain" == extension:
                                         extension = "txt"
 
                                     # If extension is still blank, set to html if the content ends with HTML tag, otherwise set to unknown
-                                    if extension == "":
+                                    if extension == "" and not isBinary:
                                         if (
-                                            archiveHtml.lower()
-                                            .strip()
-                                            .endswith("</html>")
+                                            archiveHtml.lower().strip().endswith("</html>")
                                             or archiveHtml.lower()
                                             .strip()
                                             .startswith("<!doctype html")
-                                            or archiveHtml.lower()
-                                            .strip()
-                                            .startswith("<html")
+                                            or archiveHtml.lower().strip().startswith("<html")
                                         ):
                                             extension = "html"
                                         else:
                                             extension = "unknown"
+                                    elif extension == "" and isBinary:
+                                        extension = "bin"
+
+                                # If the extension is longer than 20 characters then it's not a valid file type, so set to unknown (this also prevents "File name too long" errors)
+                                if len(extension) > 20:
+                                    extension = "unknown"
 
                                 fileName = fileName + "." + extension
 
@@ -1617,21 +2275,23 @@ def processArchiveUrl(url):
                                     + f"{fileName}"
                                 )
 
-                            # Write the file
+                            # Write the file - binary mode for binary files, text mode for text files
                             try:
-                                responseFile = open(filePath, "w", encoding="utf8")
-                                responseFile.write(archiveHtml)
+                                if isBinary:
+                                    responseFile = open(filePath, "wb")
+                                    responseFile.write(archiveContent)
+                                else:
+                                    responseFile = open(filePath, "w", encoding="utf8")
+                                    responseFile.write(archiveHtml)
                                 responseFile.close()
                                 fileCount = fileCount + 1
                             except Exception as e:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ ERR ] Failed to write file "
-                                            + filePath
-                                            + ": "
-                                            + str(e)
-                                        ),
+                                        "Wayback - [ ERR ] Failed to write file "
+                                        + filePath
+                                        + ": "
+                                        + str(e),
                                         "red",
                                     )
                                 )
@@ -1641,53 +2301,57 @@ def processArchiveUrl(url):
                                 try:
                                     timestamp = str(datetime.now())
                                     indexFile.write(
-                                        hashValue
-                                        + ","
-                                        + archiveUrl
-                                        + " ,"
-                                        + timestamp
-                                        + "\n"
+                                        hashValue + "," + archiveUrl + " ," + timestamp + "\n"
                                     )
                                     indexFile.flush()
                                 except Exception as e:
                                     writerr(
                                         colored(
-                                            getSPACER(
-                                                '[ ERR ] Failed to write to waymore_index.txt for "'
-                                                + archiveUrl
-                                                + '": '
-                                                + str(e)
-                                            ),
+                                            'Wayback - [ ERR ] Failed to write to waymore_index.txt for "'
+                                            + archiveUrl
+                                            + '": '
+                                            + str(e),
                                             "red",
                                         )
                                     )
 
-                            # FOR DEBUGGING PURPOSES
+                            # FOR DEBUGGING PURPOSES (only for text files)
                             try:
-                                if os.environ.get("USER") == "xnl":
+                                if os.environ.get("USER") == "xnl" and not isBinary:
+
                                     debugText = ""
                                     if archiveHtml.lower().find("archive.org") > 0:
                                         debugText = "ARCHIVE.ORG"
-                                    elif (
-                                        archiveHtml.lower().find("internet archive") > 0
-                                    ):
+                                    elif archiveHtml.lower().find("internet archive") > 0:
                                         debugText = "INTERNET ARCHIVE"
                                     elif archiveHtml.lower().find("wombat") > 0:
                                         debugText = "WOMBAT (JS)"
-                                    if debugText != "":
+                                    if verbose() and debugText != "":
                                         writerr(
                                             colored(
                                                 getSPACER(
-                                                    '"'
+                                                    '[ DBG ] "'
                                                     + fileName
                                                     + '" CONTAINS '
                                                     + debugText
                                                     + " - CHECK ITS A VALID REFERENCE"
                                                 ),
                                                 "yellow",
+                                                attrs=["dark"],
                                             )
                                         )
-                            except Exception:
+                            except Exception as e:
+                                if verbose():
+                                    writerr(
+                                        colored(
+                                            '[ DBG ] Error - Failed to output debug info for "'
+                                            + archiveUrl
+                                            + '": '
+                                            + str(e),
+                                            "red",
+                                            attrs=["dark"],
+                                        )
+                                    )
                                 pass
 
                     successCount = successCount + 1
@@ -1697,11 +2361,7 @@ def processArchiveUrl(url):
                     if verbose():
                         writerr(
                             colored(
-                                getSPACER(
-                                    '[ ERR ] Wayback Machine (archive.org) returned a problem for "'
-                                    + archiveUrl
-                                    + '"'
-                                ),
+                                'Wayback - [ ERR ] returned a problem for "' + archiveUrl + '"',
                                 "red",
                             )
                         )
@@ -1710,11 +2370,7 @@ def processArchiveUrl(url):
                     if verbose():
                         writerr(
                             colored(
-                                getSPACER(
-                                    '[ ERR ] Wayback Machine (archive.org) connection error for "'
-                                    + archiveUrl
-                                    + '"'
-                                ),
+                                'Wayback - [ ERR ] connection error for "' + archiveUrl + '"',
                                 "red",
                             )
                         )
@@ -1724,25 +2380,21 @@ def processArchiveUrl(url):
                         try:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        "[ "
-                                        + str(resp.status_code)
-                                        + ' ] Failed to get response for "'
-                                        + archiveUrl
-                                        + '"'
-                                    ),
+                                    "Wayback - [ "
+                                    + str(resp.status_code)
+                                    + ' ] Failed to get response for "'
+                                    + archiveUrl
+                                    + '"',
                                     "red",
                                 )
                             )
                         except Exception:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        '[ ERR ] Failed to get response for "'
-                                        + archiveUrl
-                                        + '": '
-                                        + str(e)
-                                    ),
+                                    'Wayback - [ ERR ] Failed to get response for "'
+                                    + archiveUrl
+                                    + '": '
+                                    + str(e),
                                     "red",
                                 )
                             )
@@ -1769,9 +2421,7 @@ def processArchiveUrl(url):
                             )
                     except Exception:
                         if verbose():
-                            suffix = (
-                                'Complete (To show mem use, run "pip install psutil")'
-                            )
+                            suffix = 'Complete (To show mem use, run "pip install psutil")'
                 printProgressBar(
                     successCount + failureCount,
                     totalResponses,
@@ -1796,9 +2446,7 @@ def processArchiveUrl(url):
 
             except Exception as e:
                 if verbose():
-                    writerr(
-                        colored(getSPACER('Error for "' + url + '": ' + str(e)), "red")
-                    )
+                    writerr(colored('Wayback - [ ERR ] Error for "' + url + '": ' + str(e), "red"))
 
     except Exception as e:
         writerr(colored("ERROR processArchiveUrl 1:  " + str(e), "red"))
@@ -1883,7 +2531,7 @@ def processURLOutput():
             linkCount = len(linksFound)
             write(
                 getSPACER(
-                    colored("Links found for " + subs + argsInput + ": ", "cyan")
+                    colored("\nTotal unique links found for " + subs + argsInput + ": ", "cyan")
                     + colored(str(linkCount) + " 🤘", "white")
                 )
                 + "\n"
@@ -1926,7 +2574,7 @@ def processURLOutput():
             appendedUrls = False
             if not args.output_overwrite:
                 try:
-                    with open(filename, "r") as existingLinks:
+                    with open(filename) as existingLinks:
                         for link in existingLinks.readlines():
                             linksFound.add(link.strip())
                     appendedUrls = True
@@ -1968,16 +2616,10 @@ def processURLOutput():
                         writerr(colored("ERROR processURLOutput 3: " + str(e), "red"))
 
             # If there are less links output because of filters, show the new total
-            if (
-                args.regex_after is not None
-                and linkCount > 0
-                and outputCount < linkCount
-            ):
+            if args.regex_after is not None and linkCount > 0 and outputCount < linkCount:
                 write(
                     colored(
-                        'Links found after applying filter "'
-                        + args.regex_after
-                        + '": ',
+                        'Links found after applying filter "' + args.regex_after + '": ',
                         "cyan",
                     )
                     + colored(str(outputCount) + " 🤘\n", "white")
@@ -1992,11 +2634,7 @@ def processURLOutput():
 
             if verbose():
                 if outputCount == 0:
-                    write(
-                        colored(
-                            "No links were found so nothing written to file.", "cyan"
-                        )
-                    )
+                    write(colored("No links were found so nothing written to file.", "cyan"))
                 else:
                     if appendedUrls:
                         write(
@@ -2018,11 +2656,11 @@ def processURLOutput():
                     if os.path.exists(filenameOld) and os.path.exists(filename):
 
                         # Get all the old links
-                        with open(filenameOld, "r") as oldFile:
+                        with open(filenameOld) as oldFile:
                             oldLinks = set(oldFile.readlines())
 
                         # Get all the new links
-                        with open(filename, "r") as newFile:
+                        with open(filename) as newFile:
                             newLinks = set(newFile.readlines())
 
                         # Create a file with most recent new links
@@ -2061,7 +2699,7 @@ def stripUnwanted(url):
     """
     parsed = urlparse(url)
     # Strip scheme
-    scheme = "%s://" % parsed.scheme
+    scheme = f"{parsed.scheme}://"
     strippedUrl = parsed.geturl().replace(scheme, "", 1)
     # Strip query string and fragment
     strippedUrl = strippedUrl.split("#")[0].split("?")[0]
@@ -2092,7 +2730,7 @@ def validateArgInput(x):
         if os.path.isfile(x):
             isInputFile = True
             # Open file and put all values in input list
-            with open(x, "r") as inputFile:
+            with open(x) as inputFile:
                 lines = inputFile.readlines()
             # Check if any lines start with a *. and replace without the *.
             for line in lines:
@@ -2154,17 +2792,53 @@ def validateArgDate(x):
     return x
 
 
+def cdxKeywordsFilter(pattern, filterField="original"):
+    """
+    Build a filter=original:... string for use in the Wayback CDX API.
+
+    The CDX API filter uses Python re.match() semantics (cf.
+    https://docs.python.org/3/library/re.html#re.match).  re.match anchors
+    to the START of the string but does NOT require the pattern to match to
+    the end.  A .* prefix is therefore always added so the pattern can match
+    anywhere in the URL, not just at the very start.
+
+    Whether a trailing .* is added depends on the pattern:
+      - If the pattern contains an unescaped $ ($ not preceded by \\),
+        no trailing .* is added — $ already asserts end-of-string.
+      - Otherwise a trailing .* is appended so that patterns without an
+        explicit $ anchor also match URLs where the pattern appears mid-URL.
+
+    The filterField parameter controls the CDX/CommonCrawl filter field:
+      - Wayback CDX:    filterField="original"  -> filter=original:.*(...)
+      - Common Crawl:   filterField="~url"       -> filter=~url:.*(...)
+
+    Examples:
+        r'\\.js'           -> filter=original:.*(\. js).*
+        r'\\.js$'          -> filter=original:.*(\. js$)
+        r'\\.js(\\?.*|$)' -> filter=original:.*(\. js(\\?.*|$))
+        r'\\$'             -> filter=original:.*.(\\$).*  (escaped $, literal)
+    """
+    has_end_anchor = bool(re.search(r"(?<!\\)\$", pattern))
+    suffix = "" if has_end_anchor else ".*"
+    return "&filter=" + filterField + ":.*(" + pattern + ")" + suffix
+
+
 def validateArgMimeTypes(x):
     """
     Validate the -ft and -mt arguments
     The passed values will be changed to lower case.
-    Only values matching the regex '[a-z]+\/[a-z0-9\-\+]+' separated by a comma
+    Only values matching valid MIME types separated by a comma.
+    Allowed characters either side of the single '/': A-Z a-z 0-9 ! # $ % & ' * + - . ^ _ ` { | } ~
     """
     invalid = False
     x = x.lower()
     mimeTypes = x.split(",")
+    # Valid MIME token chars: a-z 0-9 ! # $ % & ' * + - . ^ _ ` { | } ~
+    # Exactly one '/' separating type from subtype.
+    token = r"[a-z0-9!#$%&'*+\-.^_`{|}~]+"
+    pattern = re.compile(r"^" + token + r"/" + token + r"$")
     for mimeType in mimeTypes:
-        if not re.fullmatch(r"[a-z]+/[a-z0-9\-\+]+", mimeType):
+        if not pattern.match(mimeType):
             invalid = True
             break
     if invalid:
@@ -2184,47 +2858,74 @@ def validateArgProviders(x):
     - urlscan
     - virustotal
     - intelx
+    - ghostarchive
     """
     invalid = False
     x = x.lower()
     providers = x.split(",")
     for provider in providers:
         if not re.fullmatch(
-            r"(wayback|commoncrawl|otx|urlscan|virustotal|intelx)", provider
+            r"(wayback|commoncrawl|otx|urlscan|virustotal|intelx|ghostarchive)", provider
         ):
             invalid = True
             break
     if invalid:
         raise argparse.ArgumentTypeError(
-            "Pass providers separated by a comma, e.g. wayback,commoncrawl,otx,urlscan,virustotal,intelx"
+            "Pass providers separated by a comma, e.g. wayback,commoncrawl,otx,urlscan,virustotal,intelx,ghostarchive"
         )
     return x
+
+
+def validateArgIPAddress(x):
+    """
+    Validate the --source-ip argument
+    Accepts IPv4 or IPv6 addresses.
+    """
+    try:
+        ipaddress.ip_address(x)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Please provide a valid IPv4 or IPv6 address")
+    return x
+
+
+def parseDateArg(dateArg):
+    """
+    Parse a date argument from the command line into a datetime object
+    """
+    formats = {
+        4: "%Y",
+        6: "%Y%m",
+        8: "%Y%m%d",
+        10: "%Y%m%d%H",
+        12: "%Y%m%d%H%M",
+        14: "%Y%m%d%H%M%S",
+    }
+    fmt = formats.get(len(dateArg))
+    return datetime.strptime(dateArg, fmt)
 
 
 def processAlienVaultPage(url):
     """
     Get URLs from a specific page of otx.alienvault.org API for the input domain
     """
-    global totalPages, linkMimes, linksFound, stopSource, argsInput
+    global totalPages, linkMimes, linksFound, stopSourceAlienVault, argsInput, linkCountAlienVault
     try:
         # Get memory in case it exceeds threshold
         getMemory()
 
-        if not stopSource:
+        if not stopSourceAlienVault:
             try:
                 # Choose a random user agent string to use for any requests
                 userAgent = random.choice(USER_AGENT)
                 page = url.split("page=")[1]
-                session = requests.Session()
+                session = TimeoutSession()
                 session.mount("https://", HTTP_ADAPTER)
                 session.mount("http://", HTTP_ADAPTER)
                 resp = session.get(url, headers={"User-Agent": userAgent})
             except ConnectionError:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] alienvault.org connection error for page " + page
-                        ),
+                        getSPACER("AlienVault - [ ERR ] Connection error for page " + page),
                         "red",
                     )
                 )
@@ -2233,12 +2934,10 @@ def processAlienVaultPage(url):
             except Exception as e:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Error getting response for page "
-                            + page
-                            + " - "
-                            + str(e)
-                        ),
+                        "AlienVault -[ ERR ] Error getting response for page "
+                        + page
+                        + " - "
+                        + str(e),
                         "red",
                     )
                 )
@@ -2249,26 +2948,21 @@ def processAlienVaultPage(url):
                     if resp is not None:
                         # If a status other of 429, then stop processing Alien Vault
                         if resp.status_code == 429:
-                            writerr(
-                                colored(
-                                    getSPACER(
-                                        "[ 429 ] Alien Vault rate limit reached, so stopping. Links that have already been retrieved will be saved."
-                                    ),
-                                    "red",
+                            if not stopSourceAlienVault:  # Only print message once
+                                writerr(
+                                    colored(
+                                        "AlienVault - [ 429 ] Rate limit reached, so stopping. Links that have already been retrieved will be saved.",
+                                        "red",
+                                    )
                                 )
-                            )
-                            stopSource = True
+                            stopSourceAlienVault = True
                             return
                         # If the response from alienvault.com is empty then skip
                         if resp.text == "" and totalPages == 0:
                             if verbose():
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ ERR ] "
-                                            + url
-                                            + " gave an empty response."
-                                        ),
+                                        "AlienVault - [ ERR ] " + url + " gave an empty response.",
                                         "red",
                                     )
                                 )
@@ -2278,12 +2972,10 @@ def processAlienVaultPage(url):
                             if verbose():
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ "
-                                            + str(resp.status_code)
-                                            + " ] Error for "
-                                            + url
-                                        ),
+                                        "AlienVauilt - [ "
+                                        + str(resp.status_code)
+                                        + " ] Error for "
+                                        + url,
                                         "red",
                                     )
                                 )
@@ -2306,6 +2998,7 @@ def processAlienVaultPage(url):
                 if foundUrl != "":
                     # If filters are not required and subs are wanted then just add the URL to the list
                     if args.filter_responses_only and not args.no_subs:
+                        linkCountAlienVault = linkCountAlienVault + 1
                         linksFoundAdd(foundUrl)
                     else:
                         addLink = True
@@ -2332,9 +3025,7 @@ def processAlienVaultPage(url):
                             # Compare the HTTP code gainst the Code exclusions and matches
                             if MATCH_CODE != "":
                                 match = re.search(
-                                    r"("
-                                    + re.escape(MATCH_CODE).replace(",", "|")
-                                    + ")",
+                                    r"(" + re.escape(MATCH_CODE).replace(",", "|") + ")",
                                     httpCode,
                                     flags=re.IGNORECASE,
                                 )
@@ -2342,9 +3033,7 @@ def processAlienVaultPage(url):
                                     addLink = False
                             else:
                                 match = re.search(
-                                    r"("
-                                    + re.escape(FILTER_CODE).replace(",", "|")
-                                    + ")",
+                                    r"(" + re.escape(FILTER_CODE).replace(",", "|") + ")",
                                     httpCode,
                                     flags=re.IGNORECASE,
                                 )
@@ -2354,9 +3043,7 @@ def processAlienVaultPage(url):
                             # Check the URL exclusions
                             if addLink:
                                 match = re.search(
-                                    r"("
-                                    + re.escape(FILTER_URL).replace(",", "|")
-                                    + ")",
+                                    r"(" + re.escape(FILTER_URL).replace(",", "|") + ")",
                                     foundUrl,
                                     flags=re.IGNORECASE,
                                 )
@@ -2367,9 +3054,7 @@ def processAlienVaultPage(url):
                             if addLink and args.keywords_only:
                                 if args.keywords_only == "#CONFIG":
                                     match = re.search(
-                                        r"("
-                                        + re.escape(FILTER_KEYWORDS).replace(",", "|")
-                                        + ")",
+                                        r"(" + re.escape(FILTER_KEYWORDS).replace(",", "|") + ")",
                                         foundUrl,
                                         flags=re.IGNORECASE,
                                     )
@@ -2382,9 +3067,39 @@ def processAlienVaultPage(url):
                                 if match is None:
                                     addLink = False
 
+                            # Check date is in range if required
+                            if args.from_date is not None or args.to_date is not None:
+                                try:
+                                    urlDateStr = urlSection["date"]
+
+                                    # Remove fractional seconds if present
+                                    urlDateStr = urlDateStr.split(".")[0]
+
+                                    urlDate = datetime.strptime(urlDateStr, "%Y-%m-%dT%H:%M:%S")
+
+                                    # If from date passed, check
+                                    if args.from_date is not None:
+                                        fromDate = parseDateArg(args.from_date)
+                                        if urlDate < fromDate:
+                                            addLink = False
+                                    # If to date passed, check
+                                    if args.to_date is not None:
+                                        toDate = parseDateArg(args.to_date)
+                                        if urlDate >= toDate:
+                                            addLink = False
+                                except Exception as e:
+                                    if verbose():
+                                        writerr(
+                                            colored(
+                                                "ERROR processLAlienVaultPage date check: "
+                                                + str(e),
+                                                "red",
+                                            )
+                                        )
+
                         # Add link if it passed filters
                         if addLink:
-                            linksFoundAdd(foundUrl)
+                            linksFoundAdd(foundUrl, linksFoundAlienVault)
         else:
             pass
     except Exception as e:
@@ -2396,12 +3111,12 @@ def getAlienVaultUrls():
     """
     Get URLs from the Alien Vault OTX, otx.alienvault.com
     """
-    global linksFound, waymorePath, subs, path, stopProgram, totalPages, stopSource, argsInput, checkAlienVault, inputIsSubDomain, argsInputHostname
+    global linksFound, waymorePath, subs, path, stopProgram, totalPages, stopSourceAlienVault, argsInput, checkAlienVault, inputIsSubDomain, argsInputHostname, linkCountAlienVault, linksFoundAlienVault
 
     # Write the file of URL's for the passed domain/URL
     try:
-        stopSource = False
-        originalLinkCount = len(linksFound)
+        stopSourceAlienVault = False
+        linksFoundAlienVault = set()
 
         # Set the Alien Vault API indicator types of domain or hostname (has subdomain)
         if inputIsSubDomain:
@@ -2418,56 +3133,53 @@ def getAlienVaultUrls():
 
         # Get the number of pages (i.e. separate requests) that are going to be made to alienvault.com
         totalPages = 0
+        resp = None
         try:
             if not args.check_only:
                 write(
                     colored(
-                        "\rGetting the number of alienvault.com pages to search...\r",
+                        "AlienVault - [ INFO ] Getting the number of alienvault.com pages to search...",
                         "cyan",
                     )
                 )
             # Choose a random user agent string to use for any requests
             userAgent = random.choice(USER_AGENT)
-            session = requests.Session()
+            session = TimeoutSession()
             session.mount("https://", HTTP_ADAPTER)
             session.mount("http://", HTTP_ADAPTER)
-            resp = session.get(
-                url + "&showNumPages=True", headers={"User-Agent": userAgent}
-            )
+            resp = session.get(url + "&showNumPages=True", headers={"User-Agent": userAgent})
         except Exception as e:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ ERR ] Unable to get links from alienvault.com: " + str(e)
-                    ),
+                    "AlienVault - [ ERR ] Unable to get links from alienvault.com: " + str(e),
                     "red",
                 )
             )
-            return
+            # Don't return - continue to show link count at the end
 
         # If the rate limit was reached end now
-        if resp.status_code == 429:
+        if resp is not None and resp.status_code == 429:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ 429 ] Alien Vault rate limit reached so unable to get links."
-                    ),
+                    "AlienVault - [ 429 ] Rate limit reached so unable to get links.",
                     "red",
                 )
             )
-            return
+            # Don't return - continue to show link count at the end
 
-        if verbose():
+        if resp is not None and verbose():
             write(
-                getSPACER(
-                    colored("The Alien Vault URL requested to get links: ", "magenta")
-                    + colored(url, "white")
-                )
+                colored("AlienVault - [ INFO ] The URL requested to get links: ", "magenta")
+                + colored(url, "white")
                 + "\n"
             )
 
         # Carry on if something was found
-        if resp.text.lower().find('"error": "') < 0:
+        if (
+            resp is not None
+            and resp.status_code != 429
+            and resp.text.lower().find('"error": "') < 0
+        ):
 
             try:
                 # Get the JSON response
@@ -2478,9 +3190,7 @@ def getAlienVaultUrls():
             except Exception:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] There was an unexpected response from the Alien Vault API"
-                        ),
+                        "AlienVault - [ ERR ] There was an unexpected response from the API",
                         "red",
                     )
                 )
@@ -2502,16 +3212,16 @@ def getAlienVaultUrls():
                     else:
                         checkAlienVault = totalPages
                     write(
-                        colored("Get URLs from Alien Vault: ", "cyan")
+                        colored("AlienVault - [ INFO ] Getting URLs from Alien Vault: ", "cyan")
                         + colored(str(checkAlienVault) + " requests", "white")
                     )
                 else:
                     # if the page number was found then display it, but otherwise we will just try to increment until we have everything
                     write(
                         colored(
-                            "\rGetting links from "
+                            "AlienVault - [ INFO ] Getting links from "
                             + str(totalPages)
-                            + " alienvault.com API requests (this can take a while for some domains)...\r",
+                            + " alienvault.com API requests (this can take a while for some domains)...",
                             "cyan",
                         )
                     )
@@ -2531,31 +3241,26 @@ def getAlienVaultUrls():
             if verbose():
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] An error was returned in the alienvault.com response."
-                        )
-                        + "\n",
+                        "AlienVault - [ ERR ] An error was returned in the response." + "\n",
                         "red",
                     )
                 )
 
         if not args.check_only:
-            linkCount = len(linksFound) - originalLinkCount
-            if args.xwm and args.xcc:
+            if linksFoundAlienVault is not None:
+                linkCountAlienVault = len(linksFoundAlienVault)
                 write(
-                    getSPACER(
-                        colored("Links found on alienvault.com: ", "cyan")
-                        + colored(str(linkCount), "white")
-                    )
-                    + "\n"
+                    colored("AlienVault - [ INFO ] Links found on alienvault.com: ", "cyan")
+                    + colored(str(linkCountAlienVault), "white")
                 )
+                if linksFound is not None:
+                    linksFound.update(linksFoundAlienVault)
+                linksFoundAlienVault.clear()
             else:
+                linkCountAlienVault = 0
                 write(
-                    getSPACER(
-                        colored("Extra links found on alienvault.com: ", "cyan")
-                        + colored(str(linkCount), "white")
-                    )
-                    + "\n"
+                    colored("AlienVault - [ INFO ] Links found on alienvault.com: ", "cyan")
+                    + colored("0", "white")
                 )
 
     except Exception as e:
@@ -2566,7 +3271,7 @@ def processURLScanUrl(url, httpCode, mimeType, urlscanID=""):
     """
     Process a specific URL from urlscan.io to determine whether to save the link
     """
-    global argsInput, argsInputHostname, urlscanRequestLinks
+    global argsInput, argsInputHostname, urlscanRequestLinks, links_lock, linkCountURLScan, linksFoundURLScan
 
     addLink = True
 
@@ -2629,9 +3334,7 @@ def processURLScanUrl(url, httpCode, mimeType, urlscanID=""):
                             flags=re.IGNORECASE,
                         )
                     else:
-                        match = re.search(
-                            r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE
-                        )
+                        match = re.search(r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE)
                     if match is None:
                         addLink = False
 
@@ -2657,7 +3360,9 @@ def processURLScanUrl(url, httpCode, mimeType, urlscanID=""):
                 # Add MIME Types if --verbose option was selected
                 if verbose():
                     if mimeType.strip() != "":
-                        linkMimes.add(mimeType)
+                        with links_lock:
+                            if linkMimes is not None:
+                                linkMimes.add(mimeType)
 
         # Add link if it passed filters
         if addLink:
@@ -2677,11 +3382,15 @@ def processURLScanUrl(url, httpCode, mimeType, urlscanID=""):
             )
             if match is not None:
                 if args.mode in ("U", "B"):
-                    linksFoundAdd(url)
+                    # Ensure linksFoundURLScan is initialized (can be None during concurrent execution)
+                    if linksFoundURLScan is None:
+                        linksFoundURLScan = set()
+                    linksFoundAdd(url, linksFoundURLScan)
                 # If Response mode is requested then add the DOM ID to try later, for the number of responses wanted
                 if urlscanID != "" and args.mode in ("R", "B"):
                     if args.limit == 0 or len(urlscanRequestLinks) < args.limit:
-                        urlscanRequestLinks.add((url, URLSCAN_DOM_URL + urlscanID))
+                        with links_lock:
+                            urlscanRequestLinks.add((url, URLSCAN_DOM_URL + urlscanID))
 
     except Exception as e:
         writerr(colored("ERROR processURLScanUrl 1: " + str(e), "red"))
@@ -2709,36 +3418,56 @@ def getURLScanDOM(originalUrl, domUrl):
                 try:
                     # Choose a random user agent string to use for any requests
                     userAgent = "waymore v" + __version__ + " by xnl-h4ck3r"
-                    session = requests.Session()
+                    session = TimeoutSession()
                     session.mount("https://", HTTP_ADAPTER)
                     session.mount("http://", HTTP_ADAPTER)
                     resp = session.get(
                         domUrl, headers={"User-Agent": userAgent}, allow_redirects=True
                     )
-                    archiveHtml = str(resp.text)
+
+                    # Get raw content bytes first
+                    contentBytes = resp.content
+
+                    # Get content type from response headers
+                    try:
+                        contentType = resp.headers.get("Content-Type", "").split(";")[0].lower()
+                    except Exception:
+                        contentType = ""
+
+                    # Determine if this is binary content based on actual content, Content-Type, and URL
+                    isBinary = isBinaryContent(contentBytes, contentType, originalUrl)
+
+                    if isBinary:
+                        # For binary files, use raw bytes as-is
+                        archiveContent = contentBytes
+                        archiveHtml = None
+                    else:
+                        # For text files, decode to string
+                        archiveHtml = contentBytes.decode("utf-8", errors="replace")
+                        archiveContent = None
 
                     # If there is a specific URLScan error in the response, raise an exception
-                    if archiveHtml.lower().strip() == "not found!":
+                    if not isBinary and archiveHtml.lower().strip() == "not found!":
                         raise WayBackException
 
                     # Only create a file if there is a response
-                    if len(archiveHtml) != 0:
+                    responseLength = len(archiveContent) if isBinary else len(archiveHtml)
+                    if responseLength != 0:
 
-                        # Add the URL as a comment at the start of the response
-                        if args.url_filename:
-                            archiveHtml = (
-                                "/* Original URL: "
-                                + originalUrl
-                                + " */\n"
-                                + archiveHtml
-                            )
+                        # Add the URL as a comment at the start of the response (text files only)
+                        if not isBinary and args.url_filename:
+                            archiveHtml = "/* Original URL: " + originalUrl + " */\n" + archiveHtml
 
                         # Create file name based on url or hash value of the response, depending on selection. Ensure the file name isn't over 255 characters
                         if args.url_filename:
                             fileName = originalUrl.replace("/", "-").replace(":", "")
                             fileName = fileName[0:254]
                         else:
-                            hashValue = filehash(archiveHtml)
+                            # For binary files, hash the raw bytes; for text, hash the text
+                            if isBinary:
+                                hashValue = filehash(archiveContent.hex())
+                            else:
+                                hashValue = filehash(archiveHtml)
                             fileName = hashValue
 
                             # Determine extension of file from the content-type using the mimetypes library
@@ -2756,19 +3485,23 @@ def getURLScanDOM(originalUrl, domUrl):
                                 pass
 
                             # If the extension is blank, numeric, longer than 4 characters or not alphanumeric - then set to html if the content ends with HTML tag, otherwise set to unknown
-                            if extension == "":
+                            if extension == "" and not isBinary:
                                 if (
                                     archiveHtml.lower().strip().endswith("</html>")
                                     or archiveHtml.lower().strip().endswith("</body>")
-                                    or archiveHtml.lower()
-                                    .strip()
-                                    .startswith("<!doctype html")
+                                    or archiveHtml.lower().strip().startswith("<!doctype html")
                                     or archiveHtml.lower().strip().startswith("<html")
                                     or archiveHtml.lower().strip().startswith("<head")
                                 ):
                                     extension = "html"
                                 else:
                                     extension = "unknown"
+                            elif extension == "" and isBinary:
+                                extension = "bin"
+
+                            # If the extension is longer than 20 characters then it's not a valid file type, so set to unknown (this also prevents "File name too long" errors)
+                            if len(extension) > 20:
+                                extension = "unknown"
 
                             fileName = fileName + "." + extension
 
@@ -2785,21 +3518,23 @@ def getURLScanDOM(originalUrl, domUrl):
                                 + f"{fileName}"
                             )
 
-                        # Write the file
+                        # Write the file - binary mode for binary files, text mode for text files
                         try:
-                            responseFile = open(filePath, "w", encoding="utf8")
-                            responseFile.write(archiveHtml)
+                            if isBinary:
+                                responseFile = open(filePath, "wb")
+                                responseFile.write(archiveContent)
+                            else:
+                                responseFile = open(filePath, "w", encoding="utf8")
+                                responseFile.write(archiveHtml)
                             responseFile.close()
                             fileCount = fileCount + 1
                         except Exception as e:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        "[ ERR ] Failed to write file "
-                                        + filePath
-                                        + ": "
-                                        + str(e)
-                                    ),
+                                    "URLScan - [ ERR ] Failed to write file "
+                                    + filePath
+                                    + ": "
+                                    + str(e),
                                     "red",
                                 )
                             )
@@ -2822,12 +3557,10 @@ def getURLScanDOM(originalUrl, domUrl):
                             except Exception as e:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            '[ ERR ] Failed to write to waymore_index.txt for "'
-                                            + domUrl
-                                            + '": '
-                                            + str(e)
-                                        ),
+                                        'URLScan - [ ERR ] Failed to write to waymore_index.txt for "'
+                                        + domUrl
+                                        + '": '
+                                        + str(e),
                                         "red",
                                     )
                                 )
@@ -2843,25 +3576,21 @@ def getURLScanDOM(originalUrl, domUrl):
                         try:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        "[ "
-                                        + str(resp.status_code)
-                                        + ' ] Failed to get response for "'
-                                        + domUrl
-                                        + '"'
-                                    ),
+                                    "URLScan - [ "
+                                    + str(resp.status_code)
+                                    + ' ] Failed to get response for "'
+                                    + domUrl
+                                    + '"',
                                     "red",
                                 )
                             )
                         except Exception:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        '[ ERR ] Failed to get response for "'
-                                        + domUrl
-                                        + '": '
-                                        + str(e)
-                                    ),
+                                    'URLScan - [ ERR ] Failed to get response for "'
+                                    + domUrl
+                                    + '": '
+                                    + str(e),
                                     "red",
                                 )
                             )
@@ -2888,9 +3617,7 @@ def getURLScanDOM(originalUrl, domUrl):
                             )
                     except Exception:
                         if verbose():
-                            suffix = (
-                                'Complete (To show mem use, run "pip install psutil")'
-                            )
+                            suffix = 'Complete (To show mem use, run "pip install psutil")'
                 printProgressBar(
                     successCount + failureCount,
                     totalResponses,
@@ -2903,27 +3630,535 @@ def getURLScanDOM(originalUrl, domUrl):
                 # Write the total count to the continueResp.URLScan.tmp file
                 try:
                     continueRespFileURLScan.seek(0)
-                    continueRespFileURLScan.write(
-                        str(successCount + failureCount) + "\n"
-                    )
+                    continueRespFileURLScan.write(str(successCount + failureCount) + "\n")
                 except Exception as e:
                     if verbose():
-                        writerr(
-                            colored(
-                                getSPACER("ERROR getURLScanDOM 2:  " + str(e)), "red"
+                        writerr(colored(getSPACER("ERROR getURLScanDOM 2:  " + str(e)), "red"))
+
+            except Exception as e:
+                if verbose():
+                    writerr(
+                        colored('URLScan - [ ERR ] Error for "' + domUrl + '": ' + str(e), "red")
+                    )
+
+    except Exception as e:
+        writerr(colored("ERROR getURLScanDOM 1:  " + str(e), "red"))
+
+
+def getGhostArchiveWARC(originalUrl, domUrl):
+    """
+    Get the DOM for the passed GhostArchive link - parses WARC files containing multiple request/response pairs
+    """
+    global stopProgram, successCount, failureCount, fileCount, DEFAULT_OUTPUT_DIR, totalResponses, indexFile, argsInput, argsInputHostname, REGEX_404, linksFound, extraWarcLinks, links_lock
+    try:
+        if stopProgram is None:
+
+            # The WARC files are found by replacing /archive with /chimurai4 and using the .warc file extension
+            warcUrl = domUrl.replace("/archive", "/chimurai4") + ".warc"
+
+            # Get memory usage every 100 responses
+            if (successCount + failureCount) % 100 == 0:
+                try:
+                    getMemory()
+                except Exception:
+                    pass
+
+            # Fetch content
+            try:
+                # Show progress bar
+                fillTest = (successCount + failureCount) % 2
+                fillChar = "o"
+                if fillTest == 0:
+                    fillChar = "O"
+                suffix = "Complete "
+
+                printProgressBar(
+                    successCount + failureCount,
+                    totalResponses,
+                    prefix="Processing " + str(totalResponses) + " WARC files:",
+                    suffix=suffix,
+                    length=getProgressBarLength(),
+                    fill=fillChar,
+                )
+
+                try:
+                    try:
+                        if verbose() and os.environ.get("USER") == "xnl":
+                            writerr(
+                                colored(
+                                    "[ DBG ] Requesting file " + warcUrl,
+                                    "yellow",
+                                    attrs=["dark"],
+                                )
+                            )
+                    except Exception:
+                        pass
+
+                    # Choose a random user agent string to use for any requests
+                    userAgent = random.choice(USER_AGENT)
+                    session = TimeoutSession()
+                    session.mount("https://", HTTP_ADAPTER)
+                    session.mount("http://", HTTP_ADAPTER)
+
+                    # Retry loop for 503 or maintenance responses
+                    maxRetries = 3
+                    warcBytes = b""
+                    for attempt in range(maxRetries):
+                        resp = session.get(
+                            warcUrl,
+                            headers={"User-Agent": userAgent},
+                            allow_redirects=True,
+                            timeout=args.timeout,
+                        )
+                        warcBytes = resp.content
+
+                        # Check if we need to retry (decode just for this check)
+                        try:
+                            warcTextCheck = warcBytes.decode("utf-8", errors="replace").lower()
+                        except Exception:
+                            warcTextCheck = ""
+                        if resp.status_code == 503 or "website under maintenance" in warcTextCheck:
+                            if attempt < maxRetries - 1:
+                                import time
+
+                                time.sleep(0.5)
+                                continue
+                        break
+
+                    # Parse the WARC file to extract multiple responses
+                    # WARC header lines are text, but response bodies may be binary
+                    # Split by line separator but keep bytes for body extraction
+                    lineBytes = warcBytes.split(b"\n")
+                    lines = [lb.decode("utf-8", errors="replace") for lb in lineBytes]
+
+                    # State machine to track parsing
+                    currentTargetUri = ""
+                    inResponse = False
+                    contentType = ""
+                    responsesFound = (
+                        []
+                    )  # List of (targetUri, contentType, responseBytes, httpStatusCode)
+
+                    i = 0
+                    skipCurrentResponse = False  # Initialize before loop
+                    pendingResponseType = (
+                        False  # Track if we saw WARC-Type: response and are waiting for Target-URI
+                    )
+                    responseStartIdx = -1  # Initialize before loop
+                    httpStatusCode = ""  # Initialize before loop
+                    while i < len(lines) and stopProgram is None and not stopSourceGhostArchive:
+                        line = lines[i]
+
+                        # When we see a new WARC record start, reset pending state
+                        if line.startswith("WARC/1.0"):
+                            # If we were in a response and collecting, save it before moving to new record
+                            if inResponse and responseStartIdx >= 0:
+                                responseBodyBytes = b"\n".join(lineBytes[responseStartIdx:i])
+                                responsesFound.append(
+                                    (
+                                        currentTargetUri,
+                                        contentType,
+                                        responseBodyBytes,
+                                        httpStatusCode if "httpStatusCode" in dir() else "",
+                                    )
+                                )
+                                inResponse = False
+                                responseStartIdx = -1
+                                contentType = ""
+                                httpStatusCode = ""
+                            pendingResponseType = False
+                            skipCurrentResponse = False
+
+                        # Look for WARC-Type: response - mark that we're in a response record header
+                        elif line.startswith("WARC-Type: response"):
+                            pendingResponseType = True
+                            inResponse = False  # Don't start capturing body yet
+                            responseStartIdx = -1
+                            contentType = ""
+
+                        # Look for WARC-Target-URI to get the request URL
+                        elif line.startswith("WARC-Target-URI:"):
+                            currentTargetUri = line.split(":", 1)[1].strip()
+                            skipCurrentResponse = False
+
+                            # Check: URL host must contain the input hostname
+                            if argsInputHostname:
+                                try:
+                                    parsed = urlparse(currentTargetUri)
+                                    host = parsed.netloc.lower()
+                                    if argsInputHostname.lower() not in host:
+                                        skipCurrentResponse = True
+                                except Exception:
+                                    skipCurrentResponse = True
+
+                            # Check: Filter by URL (FILTER_URL)
+                            if not skipCurrentResponse and FILTER_URL and currentTargetUri:
+                                filterUrls = [u.strip().lower() for u in FILTER_URL.split(",")]
+                                for filterUrl in filterUrls:
+                                    if filterUrl in currentTargetUri.lower():
+                                        skipCurrentResponse = True
+                                        break
+
+                            # If we were waiting for Target-URI after seeing WARC-Type: response, and it's valid, start response mode
+                            if pendingResponseType and not skipCurrentResponse:
+                                inResponse = True
+                                pendingResponseType = False
+
+                        # If we're in a response section (after seeing both WARC-Type: response and valid WARC-Target-URI)
+                        elif inResponse:
+                            # Check for HTTP start and capture status code
+                            if line.startswith("HTTP"):
+                                # Extract status code (e.g., "HTTP/1.1 200 OK" -> "200")
+                                try:
+                                    httpStatusCode = line.split()[1]
+                                except Exception:
+                                    httpStatusCode = ""
+
+                                # Early check: Filter by HTTP status code (FILTER_CODE)
+                                if FILTER_CODE and httpStatusCode:
+                                    filterCodes = [c.strip() for c in FILTER_CODE.split(",")]
+                                    if httpStatusCode in filterCodes:
+                                        inResponse = False
+                                        responseStartIdx = -1
+                                        i += 1
+                                        continue
+
+                                responseStartIdx = i  # Mark start of response
+                            elif responseStartIdx >= 0:
+                                # Capture Content-Type if present (case-insensitive check)
+                                if line.lower().startswith("content-type:"):
+                                    try:
+                                        contentType = (
+                                            line.split(":", 1)[1].strip().split(";")[0].lower()
+                                        )
+                                    except Exception:
+                                        pass
+
+                                    # Early check: Filter by MIME type (FILTER_MIME)
+                                    if FILTER_MIME and contentType:
+                                        filterMimes = [
+                                            m.strip().lower() for m in FILTER_MIME.split(",")
+                                        ]
+                                        if contentType in filterMimes:
+                                            inResponse = False
+                                            responseStartIdx = -1
+                                            i += 1
+                                            continue
+
+                        i += 1
+
+                    if stopProgram is not None:
+                        return
+
+                    # Don't forget the last response if file doesn't end with WARC/1.0
+                    if inResponse and responseStartIdx >= 0:
+                        responseBodyBytes = b"\n".join(lineBytes[responseStartIdx:])
+                        responsesFound.append(
+                            (
+                                currentTargetUri,
+                                contentType,
+                                responseBodyBytes,
+                                httpStatusCode if "httpStatusCode" in dir() else "",
                             )
                         )
+
+                    # Process each response found
+                    for targetUri, contentType, responseBytes, httpStatusCode in responsesFound:
+                        if stopProgram is not None:
+                            break
+
+                        if not responseBytes:
+                            continue
+
+                        # Split HTTP header from body in bytes (look for \r\n\r\n or \n\n separator)
+                        if b"\r\n\r\n" in responseBytes:
+                            bodyBytes = responseBytes.split(b"\r\n\r\n", 1)[1]
+                        elif b"\n\n" in responseBytes:
+                            bodyBytes = responseBytes.split(b"\n\n", 1)[1]
+                        else:
+                            bodyBytes = responseBytes
+
+                        # Skip empty bodies or "not found" responses
+                        if not bodyBytes or bodyBytes.lower().strip() == b"not found":
+                            continue
+
+                        # If -f / --filter-responses-only is passed, track all URLs immediately (before filtering)
+                        if args.mode == "B" and args.filter_responses_only and targetUri:
+                            with links_lock:
+                                if targetUri not in linksFound and targetUri not in extraWarcLinks:
+                                    extraWarcLinks.add(targetUri)
+
+                        # Use isBinaryContent to detect if this is binary content
+                        isBinary = isBinaryContent(bodyBytes, contentType, targetUri)
+
+                        if isBinary:
+                            # Binary file - save raw bytes
+                            archiveContent = bodyBytes
+                            archiveHtml = None
+                        else:
+                            # Text file - decode to string
+                            archiveHtml = bodyBytes.decode("utf-8", errors="replace")
+                            archiveContent = None
+
+                            # Collapse multiple blank lines into one
+                            archiveHtml = re.sub(r"\n{3,}", "\n\n", archiveHtml)
+
+                            # Skip if body is empty after processing
+                            if not archiveHtml.strip():
+                                continue
+
+                        if stopProgram is not None:
+                            break
+
+                        # Determine if this is HTML or JS based on content-type or URL
+                        isHtml = (
+                            contentType in ["text/html", "application/xhtml+xml"]
+                            or targetUri.lower().endswith(".html")
+                            or targetUri.lower().endswith(".htm")
+                        )
+                        isJs = contentType in [
+                            "text/javascript",
+                            "application/javascript",
+                            "application/x-javascript",
+                        ] or targetUri.lower().endswith(".js")
+
+                        # Add the URL as a comment at the start of the response (only for text files)
+                        if not isBinary and args.url_filename:
+                            if isHtml:
+                                archiveHtml = (
+                                    "<!-- Original URL: " + targetUri + " -->\n" + archiveHtml
+                                )
+                            elif isJs:
+                                archiveHtml = (
+                                    "/* Original URL: " + targetUri + " */\n" + archiveHtml
+                                )
+
+                        # Create file name based on url or hash value
+                        if args.url_filename:
+                            fileName = targetUri.replace("/", "-").replace(":", "")
+                            fileName = fileName[0:254]
+                            hashValue = ""
+                        else:
+                            # Hash the content to get the filename
+                            if isBinary:
+                                hashValue = filehash(archiveContent)
+                            else:
+                                hashValue = filehash(archiveHtml)
+                            fileName = hashValue
+
+                            # Determine extension of file from the content-type or URL
+                            extension = ""
+                            try:
+                                # Get path extension from URL
+                                if "://" in targetUri:
+                                    targetUrl = "https://" + targetUri.split("://")[1]
+                                    parsed = urlparse(targetUrl.strip())
+                                    path = parsed.path
+                                    extension = path[path.rindex(".") + 1 :]
+                                    if "/" in extension:
+                                        extension = ""
+                                    # If extension is over 6 characters, it's likely not a real extension (e.g. API endpoint ID)
+                                    if len(extension) > 6:
+                                        extension = ""
+                            except Exception:
+                                pass
+
+                            # If extension is blank, determine from MIME type or content
+                            if extension == "":
+                                if isBinary:
+                                    # Binary file extensions from MIME type
+                                    if contentType:
+                                        if "image/png" in contentType:
+                                            extension = "png"
+                                        elif (
+                                            "image/jpeg" in contentType
+                                            or "image/jpg" in contentType
+                                        ):
+                                            extension = "jpg"
+                                        elif "image/gif" in contentType:
+                                            extension = "gif"
+                                        elif "image/webp" in contentType:
+                                            extension = "webp"
+                                        elif "application/pdf" in contentType:
+                                            extension = "pdf"
+                                        elif "application/zip" in contentType:
+                                            extension = "zip"
+                                        else:
+                                            extension = "bin"
+                                    else:
+                                        extension = "bin"
+                                else:
+                                    # Text file extensions
+                                    if contentType and "javascript" in contentType.lower():
+                                        extension = "js"
+                                    elif contentType and "html" in contentType.lower():
+                                        extension = "html"
+                                    elif contentType and "json" in contentType.lower():
+                                        extension = "json"
+                                    elif contentType and "text" in contentType.lower():
+                                        extension = "txt"
+                                    elif archiveHtml and (
+                                        archiveHtml.lower().strip().endswith("</html>")
+                                        or archiveHtml.lower().strip().endswith("</body>")
+                                        or archiveHtml.lower().strip().startswith("<!doctype html")
+                                        or archiveHtml.lower().strip().startswith("<html")
+                                        or archiveHtml.lower().strip().startswith("<head")
+                                    ):
+                                        extension = "html"
+                                    else:
+                                        extension = "unknown"
+
+                            fileName = fileName + "." + extension
+
+                        # Determine file path
+                        if args.output_responses != "":
+                            filePath = args.output_responses + "/" + f"{fileName}"
+                        else:
+                            filePath = (
+                                DEFAULT_OUTPUT_DIR
+                                + "/results/"
+                                + str(argsInput).replace("/", "-")
+                                + "/"
+                                + f"{fileName}"
+                            )
+
+                        if stopProgram is not None:
+                            break
+
+                        # Write the file
+                        try:
+                            if isBinary:
+                                # Binary file - write as bytes
+                                responseFile = open(filePath, "wb")
+                                responseFile.write(archiveContent)
+                            else:
+                                # Text file - write as UTF-8
+                                responseFile = open(filePath, "w", encoding="utf8")
+                                responseFile.write(archiveHtml)
+                            responseFile.close()
+                            with links_lock:
+                                fileCount = fileCount + 1
+
+                            # Track extra URLs found in WARC files for mode B (only when -f is not passed, since we track earlier if it is)
+                            if args.mode == "B" and not args.filter_responses_only and targetUri:
+                                with links_lock:
+                                    if (
+                                        targetUri not in linksFound
+                                        and targetUri not in extraWarcLinks
+                                    ):
+                                        extraWarcLinks.add(targetUri)
+                        except Exception as e:
+                            writerr(
+                                colored(
+                                    "GhostArchive - [ ERR ] Failed to write file "
+                                    + filePath
+                                    + ": "
+                                    + str(e),
+                                    "red",
+                                )
+                            )
+
+                        # Write the hash value and URL to the index file
+                        if not args.url_filename and hashValue:
+                            try:
+                                timestamp = str(datetime.now())
+                                indexFile.write(
+                                    hashValue
+                                    + ","
+                                    + domUrl
+                                    + "#"
+                                    + targetUri
+                                    + " ,"
+                                    + timestamp
+                                    + "\n"
+                                )
+                                indexFile.flush()
+                            except Exception as e:
+                                writerr(
+                                    colored(
+                                        'GhostArchive - [ ERR ] Failed to write to waymore_index.txt for "'
+                                        + warcUrl
+                                        + '": '
+                                        + str(e),
+                                        "red",
+                                    )
+                                )
+
+                    successCount = successCount + 1
+
+                except WayBackException:
+                    failureCount = failureCount + 1
+
+                except Exception as e:
+                    failureCount = failureCount + 1
+                    if verbose():
+                        # Simplify common error messages
+                        if "connection broken" in str(e).lower():
+                            errorMsg = "Connection Broken"
+                        else:
+                            errorMsg = str(e)
+                        try:
+                            statusCode = (
+                                resp.status_code if "resp" in dir() and resp is not None else "ERR"
+                            )
+                            writerr(
+                                colored(
+                                    "GhostArchive - [ "
+                                    + str(statusCode)
+                                    + ' ] Failed to get response for "'
+                                    + warcUrl
+                                    + '": '
+                                    + errorMsg,
+                                    "red",
+                                )
+                            )
+                        except Exception:
+                            writerr(
+                                colored(
+                                    'GhostArchive - [ ERR ] Failed to get response for "'
+                                    + warcUrl
+                                    + '": '
+                                    + errorMsg,
+                                    "red",
+                                )
+                            )
+
+                # Show memory usage if -v option chosen, and check memory every 25 responses (or if its the last)
+                if (successCount + failureCount) % 25 == 1 or (
+                    successCount + failureCount
+                ) == totalResponses:
+                    try:
+                        getMemory()
+                        if verbose():
+                            suffix = (
+                                "Complete (Mem Usage "
+                                + humanReadableSize(currentMemUsage)
+                                + ", Total Mem "
+                                + str(currentMemPercent)
+                                + "%)   "
+                            )
+                    except Exception:
+                        if verbose():
+                            suffix = 'Complete (To show mem use, run "pip install psutil")'
+                printProgressBar(
+                    successCount + failureCount,
+                    totalResponses,
+                    prefix="Processing " + str(totalResponses) + " WARC files:",
+                    suffix=suffix,
+                    length=getProgressBarLength(),
+                    fill=fillChar,
+                )
 
             except Exception as e:
                 if verbose():
                     writerr(
                         colored(
-                            getSPACER('Error for "' + domUrl + '": ' + str(e)), "red"
+                            'GhostArchive - [ ERR ] Error for "' + domUrl + '": ' + str(e), "red"
                         )
                     )
 
     except Exception as e:
-        writerr(colored("ERROR getURLScanDOM 1:  " + str(e), "red"))
+        writerr(colored("ERROR getGhostArchiveWARC 1:  " + str(e), "red"))
 
 
 def format_date_for_urlscan(date_str):
@@ -2945,14 +4180,15 @@ def getURLScanUrls():
     """
     Get URLs from the URLSCan API, urlscan.io
     """
-    global URLSCAN_API_KEY, linksFound, linkMimes, waymorePath, subs, stopProgram, stopSource, argsInput, checkURLScan, argsInputHostname
+    global URLSCAN_API_KEY, linksFound, linkMimes, waymorePath, subs, stopProgram, stopSourceURLScan, argsInput, checkURLScan, argsInputHostname, linkCountURLScan, linksFoundURLScan
 
     # Write the file of URL's for the passed domain/URL
     try:
         requestsMade = 0
-        stopSource = False
-        linkMimes = set()
-        originalLinkCount = len(linksFound)
+        stopSourceURLScan = False
+        linksFoundURLScan = set()
+        totalUrls = 0
+        checkResponse = True
 
         # Set the URL to just the hostname
         url = URLSCAN_URL.replace("{DOMAIN}", quote(argsInputHostname))
@@ -2975,21 +4211,23 @@ def getURLScanUrls():
             if args.mode == "R":
                 write(
                     colored(
-                        "The URLScan URL requested to get links for responses: ",
+                        "URLScan - [ INFO ] The URLScan URL requested to get links for responses: ",
                         "magenta",
                     )
                     + colored(url + "\n", "white")
                 )
             else:
                 write(
-                    colored("The URLScan URL requested to get links: ", "magenta")
+                    colored(
+                        "URLScan - [ INFO ] The URLScan URL requested to get links: ", "magenta"
+                    )
                     + colored(url + "\n", "white")
                 )
 
-        if not args.check_only:
+        if args.mode in ("U", "B") and not args.check_only:
             write(
                 colored(
-                    "\rGetting links from urlscan.io API (this can take a while for some domains)...\r",
+                    "URLScan - [ INFO ] Getting links from urlscan.io API (this can take a while for some domains)...",
                     "cyan",
                 )
             )
@@ -3001,18 +4239,16 @@ def getURLScanUrls():
             # that there are a handful of those that ALWAYS return 429. Passing a specific one all the time seems to
             # be successful all the time
             userAgent = "waymore v" + __version__ + " by xnl-h4ck3r"
-            session = requests.Session()
+            session = TimeoutSession()
             session.mount("https://", HTTP_ADAPTER)
             session.mount("http://", HTTP_ADAPTER)
             # Pass the API-Key header too. This can change the max endpoints per page, depending on URLScan subscription
-            resp = session.get(
-                url, headers={"User-Agent": userAgent, "API-Key": URLSCAN_API_KEY}
-            )
+            resp = session.get(url, headers={"User-Agent": userAgent, "API-Key": URLSCAN_API_KEY})
             requestsMade = requestsMade + 1
         except Exception as e:
             write(
                 colored(
-                    getSPACER("[ ERR ] Unable to get links from urlscan.io: " + str(e)),
+                    "URLScan - [ ERR ] Unable to get links from urlscan.io: " + str(e),
                     "red",
                 )
             )
@@ -3027,15 +4263,17 @@ def getURLScanUrls():
                 if seconds <= args.urlscan_rate_limit_retry * 60:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ 429 ] URLScan rate limit reached, so waiting for another "
-                                + str(seconds)
-                                + " seconds before continuing..."
-                            ),
+                            "URLScan - [ 429 ] Rate limit reached, so waiting for another "
+                            + str(seconds)
+                            + " seconds before continuing...",
                             "yellow",
                         )
                     )
-                    time.sleep(seconds + 1)
+                    # Wait can be interrupted by SIGINT via interrupt_event
+                    interrupt_event.clear()
+                    if interrupt_event.wait(seconds + 1):
+                        # Interrupted by SIGINT
+                        return
                     try:
                         resp = session.get(
                             url,
@@ -3048,10 +4286,7 @@ def getURLScanUrls():
                     except Exception as e:
                         write(
                             colored(
-                                getSPACER(
-                                    "[ ERR ] Unable to get links from urlscan.io: "
-                                    + str(e)
-                                ),
+                                "URLScan - [ ERR ] Unable to get links from urlscan.io: " + str(e),
                                 "red",
                             )
                         )
@@ -3064,85 +4299,74 @@ def getURLScanUrls():
                     if resp.status_code == 429:
                         writerr(
                             colored(
-                                getSPACER(
-                                    "[ 429 ] URLScan rate limit reached so trying without API Key..."
-                                ),
+                                "URLScan - [ 429 ] Rate limit reached so trying without API Key...",
                                 "red",
                             )
                         )
                     else:
                         writerr(
                             colored(
-                                getSPACER(
-                                    "The URLScan API Key is invalid so trying without API Key..."
-                                ),
+                                "URLScan - [ INF ] The API Key is invalid so trying without API Key...",
                                 "red",
                             )
                         )
                     # Set key to blank for further requests
                     URLSCAN_API_KEY = ""
-                    resp = requests.get(url, headers={"User-Agent": userAgent})
+                    session_no_key = TimeoutSession()
+                    session_no_key.mount("https://", HTTP_ADAPTER)
+                    session_no_key.mount("http://", HTTP_ADAPTER)
+                    resp = session_no_key.get(url, headers={"User-Agent": userAgent})
                 except Exception as e:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from urlscan.io: " + str(e)
-                            ),
+                            "URLScan - [ ERR ] Unable to get links from urlscan.io: " + str(e),
                             "red",
                         )
                     )
-                    return
+                    checkResponse = False
 
                 # If the rate limit was reached end now
                 if resp.status_code == 429:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ 429 ] URLScan rate limit reached without API Key so unable to get links."
-                            ),
+                            "URLScan - [ 429 ] Rate limit reached without API Key so unable to get links.",
                             "red",
                         )
                     )
-                    return
+                    checkResponse = False
             else:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ 429 ] URLScan rate limit reached so unable to get links."
-                        ),
+                        "URLScan - [ 429 ] Rate limit reached so unable to get links.",
                         "red",
                     )
                 )
-                return
+                checkResponse = False
         elif resp.status_code != 200:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ "
-                        + str(resp.status_code)
-                        + " ] Unable to get links from urlscan.io"
-                    ),
+                    "URLScan - [ "
+                    + str(resp.status_code)
+                    + " ] Unable to get links from urlscan.io",
                     "red",
                 )
             )
-            return
+            checkResponse = False
 
         try:
-            # Get the JSON response
-            jsonResp = json.loads(resp.text.strip())
+            if checkResponse:
+                # Get the JSON response
+                jsonResp = json.loads(resp.text.strip())
 
-            # Get the number of results
-            totalUrls = int(jsonResp["total"])
+                # Get the number of results
+                totalUrls = int(jsonResp["total"])
         except Exception:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ ERR ] There was an unexpected response from the URLScan API"
-                    ),
+                    "URLScan - [ ERR ] There was an unexpected response from the API",
                     "red",
                 )
             )
-            totalUrls = 0
 
         # Carry on if something was found
         if args.check_only and args.mode != "R":
@@ -3150,12 +4374,12 @@ def getURLScanUrls():
                 hasMore = jsonResp["has_more"]
                 if hasMore:
                     write(
-                        colored("Get URLs from URLScan: ", "cyan")
+                        colored("URLScan - [ INFO ] Get URLs from URLScan: ", "cyan")
                         + colored("UNKNOWN requests", "white")
                     )
                 else:
                     write(
-                        colored("Get URLs from URLScan: ", "cyan")
+                        colored("URLScan - [ INFO ] Get URLs from URLScan: ", "cyan")
                         + colored("1 request", "white")
                     )
             except Exception:
@@ -3166,7 +4390,7 @@ def getURLScanUrls():
             # Carry on if something was found
             if int(totalUrls) > 0:
 
-                while not stopSource:
+                while not stopSourceURLScan:
 
                     searchAfter = ""
 
@@ -3203,9 +4427,7 @@ def getURLScanUrls():
                             sort = urlSection["sort"]
                         except Exception:
                             sort = ""
-                        searchAfter = (
-                            "&search_after=" + str(sort[0]) + "," + str(sort[1])
-                        )
+                        searchAfter = "&search_after=" + str(sort[0]) + "," + str(sort[1])
 
                         # Get the HTTP code
                         try:
@@ -3243,12 +4465,12 @@ def getURLScanUrls():
                     if searchAfter != "":
 
                         keepTrying = True
-                        while not stopSource and keepTrying:
+                        while not stopSourceURLScan and keepTrying:
                             keepTrying = False
                             # Get the next page from urlscan.io
                             try:
                                 # Choose a random user agent string to use for any requests
-                                session = requests.Session()
+                                session = TimeoutSession()
                                 session.mount("https://", HTTP_ADAPTER)
                                 session.mount("http://", HTTP_ADAPTER)
                                 # Pass the API-Key header too. This can change the max endpoints per page, depending on URLScan subscription
@@ -3263,10 +4485,8 @@ def getURLScanUrls():
                             except Exception as e:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ ERR ] Unable to get links from urlscan.io: "
-                                            + str(e)
-                                        ),
+                                        "URLScan - [ ERR ] Unable to get links from urlscan.io: "
+                                        + str(e),
                                         "red",
                                     )
                                 )
@@ -3285,56 +4505,53 @@ def getURLScanUrls():
                                     if seconds <= args.urlscan_rate_limit_retry * 60:
                                         writerr(
                                             colored(
-                                                getSPACER(
-                                                    "[ 429 ] URLScan rate limit reached, so waiting for another "
-                                                    + str(seconds)
-                                                    + " seconds before continuing..."
-                                                ),
+                                                "URLScan - [ 429 ] Rate limit reached, so waiting for another "
+                                                + str(seconds)
+                                                + " seconds before continuing...",
                                                 "yellow",
                                             )
                                         )
-                                        time.sleep(seconds + 1)
+                                        # Wait can be interrupted by SIGINT via interrupt_event
+                                        interrupt_event.clear()
+                                        if interrupt_event.wait(seconds + 1):
+                                            # Interrupted by SIGINT
+                                            keepTrying = False
+                                            break
                                         keepTrying = True
                                         continue
                                     else:
                                         writerr(
                                             colored(
-                                                getSPACER(
-                                                    "[ 429 ] URLScan rate limit reached (waiting time of "
-                                                    + str(seconds)
-                                                    + "), so stopping. Links that have already been retrieved will be saved."
-                                                ),
+                                                "URLScan - [ 429 ] Rate limit reached (waiting time of "
+                                                + str(seconds)
+                                                + "), so stopping. Links that have already been retrieved will be saved.",
                                                 "red",
                                             )
                                         )
-                                        stopSource = True
+                                        stopSourceURLScan = True
                                         pass
                                 else:
                                     writerr(
                                         colored(
-                                            getSPACER(
-                                                "[ 429 ] URLScan rate limit reached, so stopping. Links that have already been retrieved will be saved."
-                                            ),
+                                            "URLScan - [ 429 ] Rate limit reached, so stopping. Links that have already been retrieved will be saved.",
                                             "red",
                                         )
                                     )
-                                    stopSource = True
+                                    stopSourceURLScan = True
                                     pass
                             elif resp.status_code != 200:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ "
-                                            + str(resp.status_code)
-                                            + " ] Unable to get links from urlscan.io"
-                                        ),
+                                        "URLScan - [ "
+                                        + str(resp.status_code)
+                                        + " ] Unable to get links from urlscan.io",
                                         "red",
                                     )
                                 )
-                                stopSource = True
+                                stopSourceURLScan = True
                                 pass
 
-                        if not stopSource:
+                        if not stopSourceURLScan:
                             # Get the JSON response
                             jsonResp = json.loads(resp.text.strip())
 
@@ -3342,46 +4559,39 @@ def getURLScanUrls():
                             if (
                                 jsonResp["results"] is None
                                 or len(jsonResp["results"]) == 0
-                                or (
-                                    args.limit_requests != 0
-                                    and requestsMade > args.limit_requests
-                                )
+                                or (args.limit_requests != 0 and requestsMade > args.limit_requests)
                                 or (
                                     args.mode == "R"
                                     and args.limit != 0
                                     and requestsMade > args.limit
                                 )
                             ):
-                                stopSource = True
+                                stopSourceURLScan = True
 
             # Show the MIME types found (in case user wants to exclude more)
-            if verbose() and len(linkMimes) > 0 and args.mode != "R":
+            if verbose() and linkMimes is not None and len(linkMimes) > 0 and args.mode != "R":
                 linkMimes.discard("warc/revisit")
                 write(
-                    getSPACER(
-                        colored("MIME types found: ", "magenta")
-                        + colored(str(linkMimes), "white")
-                    )
+                    colored("URLScan - [ INFO ] MIME types found: ", "magenta")
+                    + colored(str(linkMimes), "white")
                     + "\n"
                 )
 
-            linkCount = len(linksFound) - originalLinkCount
             if args.mode != "R":
-                if args.xwm and args.xcc and args.xav:
+                if linksFoundURLScan is not None:
+                    linkCountURLScan = len(linksFoundURLScan)
                     write(
-                        getSPACER(
-                            colored("Links found on urlscan.io: ", "cyan")
-                            + colored(str(linkCount), "white")
-                        )
-                        + "\n"
+                        colored("URLScan - [ INFO ] Links found on urlscan.io: ", "cyan")
+                        + colored(str(linkCountURLScan), "white")
                     )
+                    if linksFound is not None:
+                        linksFound.update(linksFoundURLScan)
+                    linksFoundURLScan.clear()
                 else:
+                    linkCountURLScan = 0
                     write(
-                        getSPACER(
-                            colored("Extra links found on urlscan.io: ", "cyan")
-                            + colored(str(linkCount), "white")
-                        )
-                        + "\n"
+                        colored("URLScan - [ INFO ] Links found on urlscan.io: ", "cyan")
+                        + colored("0", "white")
                     )
 
     except Exception as e:
@@ -3392,242 +4602,242 @@ def processWayBackPage(url):
     """
     Get URLs from a specific page of archive.org CDX API for the input domain
     """
-    global totalPages, linkMimes, linksFound, stopSource
+    global totalPages, linkMimes, linksFound, stopSourceWayback, linkCountWayback, linksFoundWayback, current_response, current_session
     try:
         # Get memory in case it exceeds threshold
         getMemory()
-
-        if not stopSource:
+        if not stopSourceWayback:
             try:
                 # Choose a random user agent string to use for any requests
                 resp = None
                 userAgent = random.choice(USER_AGENT)
                 page = url.split("page=")[1]
-                session = requests.Session()
+                session = TimeoutSession()
                 session.mount("https://", HTTP_ADAPTER)
                 session.mount("http://", HTTP_ADAPTER)
-                resp = session.get(url, headers={"User-Agent": userAgent})
-            except ConnectionError:
-                writerr(
-                    colored(
-                        getSPACER(
-                            "[ ERR ] Wayback Machine (archive.org) connection error for page "
-                            + page
-                        ),
-                        "red",
-                    )
-                )
-                resp = None
-                return
-            except Exception as e:
-                writerr(
-                    colored(
-                        getSPACER(
-                            "[ ERR ] Error getting response for page "
-                            + page
-                            + " - "
-                            + str(e)
-                        ),
-                        "red",
-                    )
-                )
-                resp = None
-                return
-            finally:
+                # expose session so SIGINT handler can close it to interrupt blocking network I/O
                 try:
-                    if resp is not None:
-                        # If a status other of 429, then stop processing Wayback Machine
-                        if resp.status_code == 429:
-                            if args.wayback_rate_limit_retry > 0:
-                                seconds = args.wayback_rate_limit_retry * 60
-                                if args.processes == 1:
-                                    writerr(
-                                        colored(
-                                            "\r[ 429 ] Wayback Machine (archive.org) rate limit reached on page "
-                                            + str(page)
-                                            + " of "
-                                            + str(totalPages)
-                                            + ", so waiting for "
-                                            + str(seconds)
-                                            + " seconds before continuing...\r",
-                                            "yellow",
-                                        )
-                                    )
-                                else:
-                                    writerr(
-                                        colored(
-                                            "\r[ 429 ] Wayback Machine (archive.org) rate limit reached, so waiting for "
-                                            + str(seconds)
-                                            + " seconds before continuing...\r",
-                                            "yellow",
-                                        )
-                                    )
-                                time.sleep(seconds)
-                                try:
-                                    resp = session.get(
-                                        url, headers={"User-Agent": userAgent}
-                                    )
-                                except ConnectionError:
-                                    writerr(
-                                        colored(
-                                            getSPACER(
-                                                "[ ERR ] Wayback Machine (archive.org) connection error for page "
-                                                + page
-                                            ),
-                                            "red",
-                                        )
-                                    )
-                                    resp = None
-                                    return
-                                except Exception as e:
-                                    writerr(
-                                        colored(
-                                            getSPACER(
-                                                "[ ERR ] Error getting response for page "
-                                                + page
-                                                + " - "
-                                                + str(e)
-                                            ),
-                                            "red",
-                                        )
-                                    )
-                                    resp = None
-                                    return
+                    current_session = session
+                except Exception:
+                    pass
 
-                        if resp.status_code == 429:
-                            writerr(
-                                colored(
-                                    getSPACER(
-                                        "[ 429 ] Wayback Machine (archive.org) rate limit reached, so stopping. Links that have already been retrieved will be saved."
-                                    ),
-                                    "red",
-                                )
-                            )
-                            stopSource = True
-                            return
-                        # If a status other of 503, then the site is unavailable
-                        if resp.status_code == 503:
-                            writerr(
-                                colored(
-                                    getSPACER(
-                                        "[ 503 ] Wayback Machine (archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify."
-                                    ),
-                                    "red",
-                                )
-                            )
-                            stopSource = True
-                            return
-                        # If the response from archive.org is empty then skip
-                        if resp.text == "" and totalPages == 0:
-                            if verbose():
+                resp = session.get(
+                    url, headers={"User-Agent": userAgent}, stream=True, timeout=args.timeout
+                )
+                # expose live response so SIGINT handler can close it to interrupt blocking I/O
+                try:
+                    current_response = resp
+                except Exception:
+                    pass
+                # Check response status in the finally block
+                if resp is not None:
+                    # If a status other of 429, then stop processing Wayback Machine
+                    if resp.status_code == 429:
+                        if args.wayback_rate_limit_retry > 0:
+                            seconds = args.wayback_rate_limit_retry * 60
+                            if args.processes == 1:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ ERR ] "
-                                            + url
-                                            + " gave an empty response."
-                                        ),
-                                        "red",
+                                        "Wayback - [ 429 ] Rate limit reached on page "
+                                        + str(page)
+                                        + " of "
+                                        + str(totalPages)
+                                        + ", so waiting for "
+                                        + str(seconds)
+                                        + " seconds before continuing...",
+                                        "yellow",
                                     )
                                 )
-                            return
-                        # If a status other than 200, then stop
-                        if resp.status_code != 200:
-                            if verbose():
+                            else:
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ "
-                                            + str(resp.status_code)
-                                            + " ] Error for "
-                                            + url
-                                        ),
-                                        "red",
+                                        "Wayback - [ 429 ] Rate limit reached, so waiting for "
+                                        + str(seconds)
+                                        + " seconds before continuing...",
+                                        "yellow",
                                     )
                                 )
-                            return
-                except ConnectionError:
-                    writerr(
-                        colored(
-                            getSPACER(
-                                "[ ERR ] Wayback Machine (archive.org) connection error for page "
-                                + page
-                            ),
-                            "red",
-                        )
-                    )
-                    resp = None
-                    return
-                except Exception as e:
-                    writerr(
-                        colored(
-                            getSPACER(
-                                "[ ERR ] Error getting response for page "
-                                + page
-                                + " - "
-                                + str(e)
-                            ),
-                            "red",
-                        )
-                    )
-                    resp = None
-                    return
-
-            # Get the URLs and MIME types. Each line is a separate JSON string
-            try:
-                for line in resp.iter_lines():
-                    results = line.decode("utf-8")
-                    foundUrl = fixArchiveOrgUrl(str(results).split(" ")[1])
-
-                    # If --filter-responses-only wasn't used, then check the URL exclusions
-                    if args.filter_responses_only:
-                        match = None
-                    else:
-                        match = re.search(
-                            r"(" + re.escape(FILTER_URL).replace(",", "|") + ")",
-                            foundUrl,
-                            flags=re.IGNORECASE,
-                        )
-                    if match is None:
-                        # Only get MIME Types if --verbose option was selected
-                        if verbose():
+                            # Wait can be interrupted by SIGINT via interrupt_event
+                            interrupt_event.clear()
+                            if interrupt_event.wait(seconds):
+                                return
                             try:
-                                mimeType = str(results).split(" ")[2]
-                                if mimeType != "":
-                                    linkMimes.add(mimeType)
+                                resp = session.get(
+                                    url,
+                                    headers={"User-Agent": userAgent},
+                                    stream=True,
+                                    timeout=args.timeout,
+                                )
+                                try:
+                                    current_response = resp
+                                except Exception:
+                                    pass
+                            except ConnectionError:
+                                writerr(
+                                    colored(
+                                        "Wayback - [ ERR ] Connection error for page " + page,
+                                        "red",
+                                    )
+                                )
+                                resp = None
+                                return
+                            except Exception as e:
+                                writerr(
+                                    colored(
+                                        "Wayback - [ ERR ] Error getting response for page "
+                                        + page
+                                        + " - "
+                                        + str(e),
+                                        "red",
+                                    )
+                                )
+                                resp = None
+                                return
+
+                    if resp.status_code == 429:
+                        writerr(
+                            colored(
+                                "Wayback - [ 429 ] Rate limit reached, so stopping. Links that have already been retrieved will be saved.",
+                                "red",
+                            )
+                        )
+                        stopSourceWayback = True
+                        return
+                    # If a status other of 503, then the site is unavailable
+                    if resp.status_code == 503:
+                        writerr(
+                            colored(
+                                "Wayback - [ 503 ] The Wayback Machine (archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify.",
+                                "red",
+                            )
+                        )
+                        stopSourceWayback = True
+                        return
+                    # If a status other than 200, then stop
+                    if resp.status_code != 200:
+                        if verbose():
+                            writerr(
+                                colored(
+                                    "Wayback - [ " + str(resp.status_code) + " ] Error for " + url,
+                                    "red",
+                                )
+                            )
+                        try:
+                            current_response = None
+                        except Exception:
+                            pass
+                        try:
+                            current_session = None
+                        except Exception:
+                            pass
+                        return
+
+                # Get the URLs and MIME types. Each line is a separate JSON string
+                # Process lines as they arrive - if connection drops, we keep what we've already processed
+                for line in resp.iter_lines():
+                    try:
+                        results = line.decode("utf-8")
+                        foundUrl = fixArchiveOrgUrl(str(results).split(" ")[1])
+
+                        # If --filter-responses-only wasn't used, then check the URL exclusions
+                        if args.filter_responses_only:
+                            match = None
+                        else:
+                            match = re.search(
+                                r"(" + re.escape(FILTER_URL).replace(",", "|") + ")",
+                                foundUrl,
+                                flags=re.IGNORECASE,
+                            )
+                        if match is None:
+                            # Only get MIME Types if --verbose option was selected
+                            if verbose():
+                                try:
+                                    mimeType = str(results).split(" ")[2]
+                                    if mimeType != "":
+                                        linkMimes.add(mimeType)
+                                except Exception:
+                                    if verbose():
+                                        writerr(
+                                            colored(
+                                                getSPACER(
+                                                    "ERROR processWayBackPage 2: Cannot get MIME type from line: "
+                                                    + str(line)
+                                                ),
+                                                "red",
+                                            )
+                                        )
+                            try:
+                                linksFoundAdd(foundUrl, linksFoundWayback)
+
                             except Exception:
                                 if verbose():
                                     writerr(
                                         colored(
                                             getSPACER(
-                                                "ERROR processWayBackPage 2: Cannot get MIME type from line: "
+                                                "ERROR processWayBackPage 3: Cannot get link from line: "
                                                 + str(line)
                                             ),
                                             "red",
                                         )
                                     )
-                                    write(resp.text)
-                        try:
-                            linksFoundAdd(foundUrl)
-                        except Exception:
-                            if verbose():
-                                writerr(
-                                    colored(
-                                        getSPACER(
-                                            "ERROR processWayBackPage 3: Cannot get link from line: "
-                                            + str(line)
-                                        ),
-                                        "red",
-                                    )
+                    except Exception:
+                        if verbose():
+                            writerr(
+                                colored(
+                                    getSPACER("ERROR processWayBackPage 4: " + str(line)), "red"
                                 )
-                                write(resp.text)
-            except Exception:
-                if verbose():
+                            )
+
+            except ConnectionError:
+                writerr(
+                    colored(
+                        "Wayback - [ ERR ] Connection error for page "
+                        + page
+                        + (
+                            f" (saved {len(linksFoundWayback)} URLs before error)"
+                            if len(linksFoundWayback) > 0
+                            else ""
+                        ),
+                        "red",
+                    )
+                )
+                try:
+                    current_response = None
+                except Exception:
+                    pass
+                try:
+                    current_session = None
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                # Even if connection drops, we've already saved the URLs processed so far
+                if len(linksFoundWayback) > 0:
                     writerr(
                         colored(
-                            getSPACER("ERROR processWayBackPage 4: " + str(line)), "red"
+                            f"Wayback - [ WARN ] Error getting response for page {page} - {str(e)} (saved {len(linksFoundWayback)} URLs before error)",
+                            "yellow",
                         )
                     )
+                else:
+                    writerr(
+                        colored(
+                            "Wayback - [ ERR ] Error getting response for page "
+                            + page
+                            + " - "
+                            + str(e),
+                            "red",
+                        )
+                    )
+                try:
+                    current_response = None
+                except Exception:
+                    pass
+                try:
+                    current_session = None
+                except Exception:
+                    pass
+                return
         else:
             pass
     except Exception as e:
@@ -3639,39 +4849,44 @@ def getWaybackUrls():
     """
     Get URLs from the Wayback Machine, archive.org
     """
-    global linksFound, linkMimes, waymorePath, subs, path, stopProgram, totalPages, stopSource, argsInput, checkWayback
+    global linksFound, linkMimes, waymorePath, subs, path, stopProgram, totalPages, stopSourceWayback, argsInput, checkWayback, linkCountWayback, linksFoundWayback
 
     # Write the file of URL's for the passed domain/URL
     try:
-        stopSource = False
+        stopSourceWayback = False
+        linksFoundWayback = set()
 
         if MATCH_MIME != "":
             filterMIME = "&filter=mimetype:" + re.escape(MATCH_MIME).replace(",", "|")
         else:
-            filterMIME = "&filter=!mimetype:warc/revisit|" + re.escape(
-                FILTER_MIME
-            ).replace(",", "|")
+            filterMIME = "&filter=!mimetype:warc/revisit|" + re.escape(FILTER_MIME).replace(
+                ",", "|"
+            )
         # If there any \+ in the MIME types, e.g. image/svg\+xml (the backslash is because it was previosuly escaped), then replace the \+ with a . otherwise the wayback API does not recognise it
         filterMIME = filterMIME.replace("\+", ".")
 
         if MATCH_CODE != "":
             filterCode = "&filter=statuscode:" + re.escape(MATCH_CODE).replace(",", "|")
         else:
-            filterCode = "&filter=!statuscode:" + re.escape(FILTER_CODE).replace(
-                ",", "|"
-            )
+            filterCode = "&filter=!statuscode:" + re.escape(FILTER_CODE).replace(",", "|")
 
         # Set keywords filter if -ko argument passed
         filterKeywords = ""
         if args.keywords_only:
             if args.keywords_only == "#CONFIG":
-                filterKeywords = (
-                    "&filter=original:.*("
-                    + re.escape(FILTER_KEYWORDS).replace(",", "|")
-                    + ").*"
-                )
+                filterKeywords = cdxKeywordsFilter(re.escape(FILTER_KEYWORDS).replace(",", "|"))
             else:
-                filterKeywords = "&filter=original:.*(" + args.keywords_only + ").*"
+                filterKeywords = cdxKeywordsFilter(args.keywords_only)
+
+        # Add the date filters if they were passed
+        if args.from_date is None:
+            filterFrom = ""
+        else:
+            filterFrom = "&from=" + str(args.from_date)
+        if args.to_date is None:
+            filterTo = ""
+        else:
+            filterTo = "&to=" + str(args.to_date)
 
         if args.filter_responses_only:
             url = (
@@ -3688,6 +4903,8 @@ def getWaybackUrls():
                 + filterMIME
                 + filterCode
                 + filterKeywords
+                + filterFrom
+                + filterTo
                 + "&page="
             )
 
@@ -3697,18 +4914,16 @@ def getWaybackUrls():
             if not args.check_only:
                 write(
                     colored(
-                        "\rGetting the number of Wayback Machine (archive.org) pages to search...\r",
+                        "Wayback - [ INFO ] Getting the number of pages to search...",
                         "cyan",
                     )
                 )
             # Choose a random user agent string to use for any requests
             userAgent = random.choice(USER_AGENT)
-            session = requests.Session()
+            session = TimeoutSession()
             session.mount("https://", HTTP_ADAPTER)
             session.mount("http://", HTTP_ADAPTER)
-            resp = session.get(
-                url + "&showNumPages=True", headers={"User-Agent": userAgent}
-            )
+            resp = session.get(url + "&showNumPages=True", headers={"User-Agent": userAgent})
             # Try to get the total number of pages. If there is a problem, we'll return totalPages = 0 which means we'll get everything back in one request
             try:
                 totalPages = int(resp.text.strip())
@@ -3724,9 +4939,7 @@ def getWaybackUrls():
                 if resp.status_code == 429:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ 429 ] Wayback Machine (Archive.org) rate limit reached so unable to get links."
-                            ),
+                            "Wayback - [ 429 ] Rate limit reached so unable to get links.",
                             "red",
                         )
                     )
@@ -3736,30 +4949,41 @@ def getWaybackUrls():
                 if resp.status_code == 503:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ 503 ] Wayback Machine (Archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify."
-                            ),
+                            "Wayback - [ 503 ] The Wayback Machine (Archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify.",
                             "red",
                         )
                     )
                     return
 
+                # If a Gateway Timeout, show a hint if -ko was used
+                if resp.status_code in (502, 504):
+                    msg = (
+                        "Wayback - [ "
+                        + str(resp.status_code)
+                        + " ] Gateway Timeout from the Wayback Machine (Archive.org)."
+                    )
+                    if args.keywords_only:
+                        msg += (
+                            " This may be caused by a complex -ko / --keywords-only regex."
+                            " The pattern is used as a CDX filter with a .* prefix (e.g. .*your_pattern),"
+                            " so it must match the rest of the URL to the end."
+                            " Try simplifying the pattern, e.g. '\\. js' instead of '\\. js(\\?|$)'."
+                        )
+                    writerr(colored(msg, "red"))
+                    return
+
                 if resp.text.lower().find("blocked site error") > 0:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from Wayback Machine (archive.org): Blocked Site Error (they block the target site)"
-                            ),
+                            "Wayback - [ ERR ] Unable to get links from Wayback Machine (archive.org): Blocked Site Error (they block the target site)",
                             "red",
                         )
                     )
                 else:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from Wayback Machine (archive.org): "
-                                + str(resp.text.strip())
-                            ),
+                            "Wayback - [ ERR ] Unable to get links from Wayback Machine (archive.org): "
+                            + str(resp.text.strip()),
                             "red",
                         )
                     )
@@ -3767,28 +4991,22 @@ def getWaybackUrls():
                 if str(e).lower().find("alert access denied"):
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from Wayback Machine (archive.org): Access Denied. Are you able to manually visit https://web.archive.org/? Your ISP may be blocking you, e.g. your adult content filter is on (why it triggers that filter I don't know, but it has happened!)"
-                            ),
+                            "Wayback - [ ERR ] Unable to get links from Wayback Machine (archive.org): Access Denied. Are you able to manually visit https://web.archive.org/? Your ISP may be blocking you, e.g. your adult content filter is on (why it triggers that filter I don't know, but it has happened!)",
                             "red",
                         )
                     )
                 elif str(e).lower().find("connection refused"):
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from Wayback Machine (archive.org): Connection Refused. Are you able to manually visit https://web.archive.org/? Your ISP may be blocking your IP)"
-                            ),
+                            "Wayback - [ ERR ] Unable to get links from Wayback Machine (archive.org): Connection Refused. Are you able to manually visit https://web.archive.org/? Your ISP may be blocking your IP)",
                             "red",
                         )
                     )
                 else:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Unable to get links from Wayback Machine (archive.org): "
-                                + str(e)
-                            ),
+                            "Wayback - [ ERR ] Unable to get links from Wayback Machine (archive.org): "
+                            + str(e),
                             "red",
                         )
                     )
@@ -3798,27 +5016,29 @@ def getWaybackUrls():
             if totalPages < 0:
                 write(
                     colored(
-                        "Due to a change in Wayback Machine API, all URLs will be retrieved in one request and it is not possible to determine how long it will take, so please ignore this.",
+                        "Wayback - [ INFO ] Due to a change in Wayback Machine API, all URLs will be retrieved in one request and it is not possible to determine how long it will take, so please ignore this.",
                         "cyan",
                     )
                 )
             else:
                 checkWayback = totalPages
                 write(
-                    colored("Get URLs from Wayback Machine: ", "cyan")
+                    colored("Wayback - [ INFO ] Get URLs from Wayback Machine: ", "cyan")
                     + colored(str(checkWayback) + " requests", "white")
                 )
         else:
             if verbose():
                 write(
-                    colored("The archive URL requested to get links: ", "magenta")
+                    colored(
+                        "Wayback - [ INFO ] The archive URL requested to get links: ", "magenta"
+                    )
                     + colored(url + "\n", "white")
                 )
 
             if totalPages < 0:
                 write(
                     colored(
-                        "\rGetting links from Wayback Machine (archive.org) with one request (this can take a while for some domains)...\r",
+                        "Wayback - [ INFO ] Getting links from Wayback Machine (archive.org) with one request (this can take a while for some domains)...",
                         "cyan",
                     )
                 )
@@ -3828,9 +5048,9 @@ def getWaybackUrls():
                 # if the page number was found then display it, but otherwise we will just try to increment until we have everything
                 write(
                     colored(
-                        "\rGetting links from "
+                        "Wayback - [ INFO ] Getting links from "
                         + str(totalPages)
-                        + " Wayback Machine (archive.org) API requests (this can take a while for some domains)...\r",
+                        + " Wayback Machine (archive.org) API requests (this can take a while for some domains)...",
                         "cyan",
                     )
                 )
@@ -3851,28 +5071,37 @@ def getWaybackUrls():
                     p.join()
 
             # Show the MIME types found (in case user wants to exclude more)
-            if verbose() and len(linkMimes) > 0:
+            if verbose() and linkMimes is not None and len(linkMimes) > 0:
                 linkMimes.discard("warc/revisit")
                 write(
-                    getSPACER(
-                        colored("MIME types found: ", "magenta")
-                        + colored(str(linkMimes), "white")
-                    )
+                    colored("Wayback - [ INFO ] MIME types found: ", "magenta")
+                    + colored(str(linkMimes), "white")
                     + "\n"
                 )
                 linkMimes = None
 
             if not args.xwm:
-                linkCount = len(linksFound)
-                write(
-                    getSPACER(
+                if linksFoundWayback is not None:
+                    linkCountWayback = len(linksFoundWayback)
+                    write(
                         colored(
-                            "Links found on Wayback Machine (archive.org): ", "cyan"
+                            "Wayback - [ INFO ] Links found on Wayback Machine (archive.org): ",
+                            "cyan",
                         )
-                        + colored(str(linkCount), "white")
+                        + colored(str(linkCountWayback), "white")
                     )
-                    + "\n"
-                )
+                    if linksFound is not None:
+                        linksFound.update(linksFoundWayback)
+                    linksFoundWayback.clear()
+                else:
+                    linkCountWayback = 0
+                    write(
+                        colored(
+                            "Wayback - [ INFO ] Links found on Wayback Machine (archive.org): ",
+                            "cyan",
+                        )
+                        + colored("0", "white")
+                    )
 
     except Exception as e:
         writerr(colored("ERROR getWaybackUrls 1: " + str(e), "red"))
@@ -3882,13 +5111,13 @@ def processCommonCrawlCollection(cdxApiUrl):
     """
     Get URLs from a given Common Crawl index collection
     """
-    global subs, path, linksFound, linkMimes, stopSource, argsInput
+    global subs, path, linksFound, linkMimes, stopSourceCommonCrawl, argsInput, linkCountCommonCrawl, linksFoundCommonCrawl, current_response, current_session
 
     try:
         # Get memory in case it exceeds threshold
         getMemory()
 
-        if not stopSource:
+        if not stopSourceCommonCrawl:
             # Set mime content type filter
             if MATCH_MIME.strip() != "":
                 filterMIME = "&filter=~mime:("
@@ -3902,31 +5131,21 @@ def processCommonCrawlCollection(cdxApiUrl):
             # Set status code filter
             filterCode = ""
             if MATCH_CODE.strip() != "":
-                filterCode = (
-                    "&filter=~status:(" + re.escape(MATCH_CODE).replace(",", "|") + ")"
-                )
+                filterCode = "&filter=~status:(" + re.escape(MATCH_CODE).replace(",", "|") + ")"
             else:
-                filterCode = (
-                    "&filter=!~status:("
-                    + re.escape(FILTER_CODE).replace(",", "|")
-                    + ")"
-                )
+                filterCode = "&filter=!~status:(" + re.escape(FILTER_CODE).replace(",", "|") + ")"
 
             # Set keywords filter if -ko argument passed
             filterKeywords = ""
             if args.keywords_only:
                 if args.keywords_only == "#CONFIG":
-                    filterKeywords = (
-                        "&filter=~url:.*("
-                        + re.escape(FILTER_KEYWORDS).replace(",", "|")
-                        + ").*"
+                    filterKeywords = cdxKeywordsFilter(
+                        re.escape(FILTER_KEYWORDS).replace(",", "|"), "~url"
                     )
                 else:
-                    filterKeywords = "&filter=~url:.*(" + args.keywords_only + ").*"
+                    filterKeywords = cdxKeywordsFilter(args.keywords_only, "~url")
 
-            commonCrawlUrl = (
-                cdxApiUrl + "?output=json&fl=timestamp,url,mime,status,digest&url="
-            )
+            commonCrawlUrl = cdxApiUrl + "?output=json&fl=timestamp,url,mime,status,digest&url="
 
             if args.filter_responses_only:
                 url = commonCrawlUrl + subs + quote(argsInput) + path
@@ -3944,28 +5163,29 @@ def processCommonCrawlCollection(cdxApiUrl):
             try:
                 # Choose a random user agent string to use for any requests
                 userAgent = random.choice(USER_AGENT)
-                session = requests.Session()
+                session = TimeoutSession()
                 session.mount("https://", HTTP_ADAPTER_CC)
                 session.mount("http://", HTTP_ADAPTER_CC)
+                try:
+                    current_session = session
+                except Exception:
+                    pass
                 resp = session.get(url, stream=True, headers={"User-Agent": userAgent})
+                try:
+                    current_response = resp
+                except Exception:
+                    pass
             except ConnectionError:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Common Crawl connection error for index "
-                            + cdxApiUrl
-                        ),
+                        "CommonCrawl - [ ERR ] Connection error for index " + cdxApiUrl,
                         "red",
                     )
                 )
                 resp = None
                 return
             except Exception as e:
-                writerr(
-                    colored(
-                        getSPACER("[ ERR ] Error getting response - " + str(e)), "red"
-                    )
-                )
+                writerr(colored("CommonCrawl - [ ERR ] Error getting response - " + str(e), "red"))
                 resp = None
                 return
             finally:
@@ -3975,13 +5195,11 @@ def processCommonCrawlCollection(cdxApiUrl):
                         if resp.status_code == 429:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        "[ 429 ] Common Crawl rate limit reached, so stopping. Links that have already been retrieved will be saved."
-                                    ),
+                                    "CommonCrawl - [ 429 ] Rate limit reached, so stopping. Links that have already been retrieved will be saved.",
                                     "red",
                                 )
                             )
-                            stopSource = True
+                            stopSourceCommonCrawl = True
                             return
                         # If the response from commoncrawl.org says nothing was found...
                         if resp.text.lower().find("no captures found") > 0:
@@ -3992,11 +5210,7 @@ def processCommonCrawlCollection(cdxApiUrl):
                             if verbose():
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ ERR ] "
-                                            + url
-                                            + " gave an empty response."
-                                        ),
+                                        "CommonCrawl - [ ERR ] " + url + " gave an empty response.",
                                         "red",
                                     )
                                 )
@@ -4006,12 +5220,10 @@ def processCommonCrawlCollection(cdxApiUrl):
                             if verbose():
                                 writerr(
                                     colored(
-                                        getSPACER(
-                                            "[ "
-                                            + str(resp.status_code)
-                                            + " ] Error for "
-                                            + cdxApiUrl
-                                        ),
+                                        "CommonCrawl - [ "
+                                        + str(resp.status_code)
+                                        + " ] Error for "
+                                        + cdxApiUrl,
                                         "red",
                                     )
                                 )
@@ -4020,27 +5232,71 @@ def processCommonCrawlCollection(cdxApiUrl):
                     pass
 
             # Get the URLs and MIME types
-            for line in resp.iter_lines():
-                results = line.decode("utf-8")
-                try:
-                    data = json.loads(results)
-                    # Get MIME Types if --verbose option was seletced
-                    if verbose():
-                        try:
-                            if data["mime"] != "":
-                                linkMimes.add(data["mime"])
-                        except Exception:
-                            pass
-                    linksFoundAdd(data["url"])
-                except Exception:
-                    if verbose():
-                        writerr(
-                            colored(
-                                "ERROR processCommonCrawlCollection 2: Cannot get URL and MIME type from line: "
-                                + str(line),
-                                "red",
+            try:
+                for line in resp.iter_lines():
+                    results = line.decode("utf-8")
+                    try:
+                        data = json.loads(results)
+                        # Get MIME Types if --verbose option was seletced
+                        if verbose():
+                            try:
+                                if data["mime"] != "":
+                                    linkMimes.add(data["mime"])
+                            except Exception:
+                                pass
+                        # If -from or -to were passed, check the timestamp of the URL.
+                        # Only continue if the URL falls within the date range specified
+                        if args.from_date is not None or args.to_date is not None:
+                            try:
+                                ts = data["timestamp"]
+
+                                # Normalize helper: pad/truncate date string to 14 digits (YYYYMMDDhhmmss)
+                                def normalize_date(d, is_from):
+                                    if d is None:
+                                        return None
+                                    d = d.strip()
+                                    # Pad to 14 digits: from_date pads with 0s, to_date with 9s
+                                    if is_from:
+                                        return (d + "0" * (14 - len(d)))[:14]
+                                    else:
+                                        return (d + "9" * (14 - len(d)))[:14]
+
+                                from_ts = normalize_date(args.from_date, True)
+                                to_ts = normalize_date(args.to_date, False)
+
+                                # Compare numerically
+                                if from_ts and ts < from_ts:
+                                    continue
+                                if to_ts and ts > to_ts:
+                                    continue
+
+                            except Exception:
+                                writerr(
+                                    colored(
+                                        "ERROR processCommonCrawlCollection 3: Cannot get timestamp from line {line}: {str(e)}",
+                                        "red",
+                                    )
+                                )
+
+                        linksFoundAdd(data["url"], linksFoundCommonCrawl)
+                    except Exception:
+                        if verbose():
+                            writerr(
+                                colored(
+                                    "ERROR processCommonCrawlCollection 2: Cannot get URL and MIME type from line: "
+                                    + str(line),
+                                    "red",
+                                )
                             )
-                        )
+            finally:
+                try:
+                    current_response = None
+                except Exception:
+                    pass
+                try:
+                    current_session = None
+                except Exception:
+                    pass
         else:
             pass
     except Exception as e:
@@ -4067,10 +5323,8 @@ def getCommonCrawlIndexes():
                 except Exception as e:
                     writerr(
                         colored(
-                            getSPACER(
-                                "[ ERR ] Couldn't delete local version of Common Crawl index file: "
-                                + str(e)
-                            ),
+                            "CommonCrawl - [ ERR ] Couldn't delete local version of Common Crawl index file: "
+                            + str(e),
                             "red",
                         )
                     )
@@ -4081,17 +5335,15 @@ def getCommonCrawlIndexes():
         if not createFile:
             # Read the indexes from the local file
             try:
-                with open(collinfoPath, "r") as file:
+                with open(collinfoPath) as file:
                     jsonResp = file.read()
                 file.close()
             except Exception as e:
                 createFile = True
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Couldn't read local version of Common Crawl index file: "
-                            + str(e)
-                        ),
+                        "CommonCrawl - [ ERR ] Couldn't read local version of Common Crawl index file: "
+                        + str(e),
                         "red",
                     )
                 )
@@ -4101,18 +5353,14 @@ def getCommonCrawlIndexes():
             try:
                 # Choose a random user agent string to use for any requests
                 userAgent = random.choice(USER_AGENT)
-                session = requests.Session()
+                session = TimeoutSession()
                 session.mount("https://", HTTP_ADAPTER_CC)
                 session.mount("http://", HTTP_ADAPTER_CC)
-                indexes = session.get(
-                    CCRAWL_INDEX_URL, headers={"User-Agent": userAgent}
-                )
+                indexes = session.get(CCRAWL_INDEX_URL, headers={"User-Agent": userAgent})
             except ConnectionError:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Common Crawl connection error getting Index file"
-                        ),
+                        "CommonCrawl - [ ERR ] Connection error getting Index file",
                         "red",
                     )
                 )
@@ -4120,10 +5368,8 @@ def getCommonCrawlIndexes():
             except Exception as e:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Error getting Common Crawl index collection - "
-                            + str(e)
-                        ),
+                        "CommonCrawl - [ ERR ] Error getting Common Crawl index collection - "
+                        + str(e),
                         "red",
                     )
                 )
@@ -4133,9 +5379,7 @@ def getCommonCrawlIndexes():
             if indexes.status_code == 429:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ 429 ] Common Crawl rate limit reached so unable to get links."
-                        ),
+                        "CommonCrawl - [ 429 ] Rate limit reached so unable to get links.",
                         "red",
                     )
                 )
@@ -4144,7 +5388,7 @@ def getCommonCrawlIndexes():
             elif indexes.status_code == 503:
                 writerr(
                     colored(
-                        getSPACER("[ 503 ] Common Crawl seems to be unavailable."),
+                        "CommonCrawl - [ 503 ] Common Crawl seems to be unavailable.",
                         "red",
                     )
                 )
@@ -4152,11 +5396,9 @@ def getCommonCrawlIndexes():
             elif indexes.status_code != 200:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ "
-                            + str(indexes.status_code)
-                            + " ] Common Crawl did not retrun the indexes file."
-                        ),
+                        "CommonCrawl - [ "
+                        + str(indexes.status_code)
+                        + " ] Common Crawl did not retrun the indexes file.",
                         "red",
                     )
                 )
@@ -4173,10 +5415,8 @@ def getCommonCrawlIndexes():
             except Exception as e:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Couldn't create local version of Common Crawl index file: "
-                            + str(e)
-                        ),
+                        "CommonCrawl - [ ERR ] Couldn't create local version of Common Crawl index file: "
+                        + str(e),
                         "red",
                     )
                 )
@@ -4187,26 +5427,40 @@ def getCommonCrawlIndexes():
         for values in json.loads(jsonResp):
             for key in values:
                 if key == "cdx-api":
-                    if args.lcy != 0:
+                    if args.from_date is not None or args.to_date is not None:
                         try:
                             indexYear = values[key].split("CC-MAIN-")[1][:4]
-                            if int(indexYear) >= args.lcy:
-                                cdxApiUrls.add(values[key])
+
+                            # Only get the indexes that fall within the date range specified
+                            if args.from_date is not None:
+                                fromYear = int(args.from_date[:4])
+                                # There are a few exceptions with the filename format at the start of Common Crawl indexes where it contains 2 years, so deal with those (e.g. CC-MAIN-2009-2010-index and CC-MAIN-2008-2009-index)
+                                if fromYear in (2009, 2010):
+                                    fromYear = fromYear - 1
+                                if int(indexYear) < fromYear:
+                                    continue
+                            if args.to_date is not None:
+                                toYear = int(args.to_date[:4])
+                                if int(indexYear) > toYear:
+                                    continue
+                            # If it passed the date range checks then add the index URL
+                            cdxApiUrls.add(values[key])
+                            collection = collection + 1
                         except Exception as e:
                             writerr(
                                 colored(
-                                    getSPACER(
-                                        "[ ERR ] Failed to get the year from index name "
-                                        + values[key]
-                                        + " - "
-                                        + str(e)
-                                    ),
+                                    "CommonCrawl - [ ERR ] Failed to get the year from index name "
+                                    + values[key]
+                                    + " - "
+                                    + str(e),
                                     "red",
                                 )
                             )
                     else:
                         cdxApiUrls.add(values[key])
-            collection = collection + 1
+                        collection = collection + 1
+
+            # Only get the most recent number of indexes specified by -lcc argument
             if collection == args.lcc:
                 break
 
@@ -4220,12 +5474,11 @@ def getCommonCrawlUrls():
     """
     Get all Common Crawl index collections to get all URLs from each one
     """
-    global linksFound, linkMimes, waymorePath, subs, path, stopSource, argsInput, checkCommonCrawl
+    global linksFound, linkMimes, waymorePath, subs, path, stopSourceCommonCrawl, argsInput, checkCommonCrawl, linkCountCommonCrawl, linksFoundCommonCrawl
 
     try:
-        stopSource = False
-        linkMimes = set()
-        originalLinkCount = len(linksFound)
+        stopSourceCommonCrawl = False
+        linksFoundCommonCrawl = set()
 
         # Set mime content type filter
         if MATCH_MIME.strip() != "":
@@ -4240,13 +5493,19 @@ def getCommonCrawlUrls():
         # Set status code filter
         filterCode = ""
         if MATCH_CODE.strip() != "":
-            filterCode = (
-                "&filter=~status:(" + re.escape(MATCH_CODE).replace(",", "|") + ")"
-            )
+            filterCode = "&filter=~status:(" + re.escape(MATCH_CODE).replace(",", "|") + ")"
         else:
-            filterCode = (
-                "&filter=!~status:(" + re.escape(FILTER_CODE).replace(",", "|") + ")"
-            )
+            filterCode = "&filter=!~status:(" + re.escape(FILTER_CODE).replace(",", "|") + ")"
+
+        # Set keywords filter if -ko argument passed (for verbose display)
+        filterKeywords = ""
+        if args.keywords_only:
+            if args.keywords_only == "#CONFIG":
+                filterKeywords = cdxKeywordsFilter(
+                    re.escape(FILTER_KEYWORDS).replace(",", "|"), "~url"
+                )
+            else:
+                filterKeywords = cdxKeywordsFilter(args.keywords_only, "~url")
 
         if verbose():
             if args.filter_responses_only:
@@ -4264,10 +5523,11 @@ def getCommonCrawlUrls():
                     + path
                     + filterMIME
                     + filterCode
+                    + filterKeywords
                 )
             write(
                 colored(
-                    "The commoncrawl index URL requested to get links (where {CDX-API-URL} is from "
+                    "CommonCrawl - [ INFO ] The index URL requested to get links (where {CDX-API-URL} is from "
                     + CCRAWL_INDEX_URL
                     + "): ",
                     "magenta",
@@ -4276,9 +5536,7 @@ def getCommonCrawlUrls():
             )
 
         if not args.check_only:
-            write(
-                colored("\rGetting commoncrawl.org index collections list...\r", "cyan")
-            )
+            write(colored("CommonCrawl - [ INFO ] Getting index collections list...", "cyan"))
 
         # Get the Common Crawl index collections
         cdxApiUrls = getCommonCrawlIndexes()
@@ -4291,15 +5549,15 @@ def getCommonCrawlUrls():
                 else:
                     checkCommonCrawl = len(cdxApiUrls) + 1
                 write(
-                    colored("Get URLs from Common Crawl: ", "cyan")
+                    colored("CommonCrawl - [ INFO ] Get URLs from Common Crawl: ", "cyan")
                     + colored(str(checkCommonCrawl) + " requests", "white")
                 )
             else:
                 write(
                     colored(
-                        "\rGetting links from the latest "
+                        "CommonCrawl - [ INFO ] Getting links from the latest "
                         + str(len(cdxApiUrls))
-                        + " commoncrawl.org index collections (this can take a while for some domains)...\r",
+                        + " commoncrawl.org index collections (this can take a while for some domains)...",
                         "cyan",
                     )
                 )
@@ -4312,32 +5570,28 @@ def getCommonCrawlUrls():
                     p.join()
 
                 # Show the MIME types found (in case user wants to exclude more)
-                if verbose() and len(linkMimes) > 0:
+                if verbose() and linkMimes is not None and len(linkMimes) > 0:
                     linkMimes.discard("warc/revisit")
                     write(
-                        getSPACER(
-                            colored("MIME types found: ", "magenta")
-                            + colored(str(linkMimes), "white")
-                        )
+                        colored("CommonCrawl - [ INFO ] MIME types found: ", "magenta")
+                        + colored(str(linkMimes), "white")
                         + "\n"
                     )
 
-                linkCount = len(linksFound) - originalLinkCount
-                if args.xwm:
+                if linksFoundCommonCrawl is not None:
+                    linkCountCommonCrawl = len(linksFoundCommonCrawl)
                     write(
-                        getSPACER(
-                            colored("Links found on commoncrawl.org: ", "cyan")
-                            + colored(str(linkCount), "white")
-                        )
-                        + "\n"
+                        colored("CommonCrawl - [ INFO ] Links found on commoncrawl.org: ", "cyan")
+                        + colored(str(linkCountCommonCrawl), "white")
                     )
+                    if linksFound is not None:
+                        linksFound.update(linksFoundCommonCrawl)
+                    linksFoundCommonCrawl.clear()
                 else:
+                    linkCountCommonCrawl = 0
                     write(
-                        getSPACER(
-                            colored("Extra links found on commoncrawl.org: ", "cyan")
-                            + colored(str(linkCount), "white")
-                        )
-                        + "\n"
+                        colored("CommonCrawl - [ INFO ] Links found on commoncrawl.org: ", "cyan")
+                        + colored("0", "white")
                     )
 
     except Exception as e:
@@ -4348,7 +5602,7 @@ def processVirusTotalUrl(url):
     """
     Process a specific URL from virustotal.com to determine whether to save the link
     """
-    global argsInput, argsInputHostname
+    global argsInput, argsInputHostname, linkCountVirusTotal, linksFoundVirusTotal
 
     addLink = True
 
@@ -4394,9 +5648,7 @@ def processVirusTotalUrl(url):
                             flags=re.IGNORECASE,
                         )
                     else:
-                        match = re.search(
-                            r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE
-                        )
+                        match = re.search(r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE)
                     if match is None:
                         addLink = False
 
@@ -4417,7 +5669,7 @@ def processVirusTotalUrl(url):
                 flags=re.IGNORECASE,
             )
             if match is not None:
-                linksFoundAdd(url)
+                linksFoundAdd(url, linksFoundVirusTotal)
 
     except Exception as e:
         writerr(colored("ERROR processVirusTotalUrl 1: " + str(e), "red"))
@@ -4425,58 +5677,50 @@ def processVirusTotalUrl(url):
 
 def getVirusTotalUrls():
     """
-    Get URLs from the VirusTotal API v2
+    Get URLs from the VirusTotal API v2 and process them.
+    Each URL is normalized as (url, scan_date) tuple. Dates are filtered according to args.from_date / args.to_date.
     """
-    global VIRUSTOTAL_API_KEY, linksFound, linkMimes, waymorePath, subs, stopProgram, stopSource, argsInput, checkVirusTotal, argsInputHostname
+    global VIRUSTOTAL_API_KEY, linksFound, linkMimes, waymorePath, subs, stopProgram, stopSourceVirusTotal, argsInput, checkVirusTotal, argsInputHostname, linkCountVirusTotal, linksFoundVirusTotal
 
-    # Write the file of URL's for the passed domain/URL
     try:
-        requestsMade = 0
-        stopSource = False
-        linkMimes = set()
-        originalLinkCount = len(linksFound)
+        stopSourceVirusTotal = False
+        linksFoundVirusTotal = set()
 
-        # Just pass the hostname in the URL
+        # Build the VirusTotal API URL
         url = VIRUSTOTAL_URL.replace("{DOMAIN}", quote(argsInputHostname)).replace(
             "{APIKEY}", VIRUSTOTAL_API_KEY
         )
 
         if verbose():
             write(
-                colored("The VirusTotal URL requested to get links: ", "magenta")
+                colored("VirusTotal - [ INFO ] The URL requested to get links: ", "magenta")
                 + colored(url + "\n", "white")
             )
 
         if not args.check_only:
-            write(colored("\rGetting links from virustotal.com API...\r", "cyan"))
+            write(colored("VirusTotal - [ INFO ] Getting links from virustotal.com API...", "cyan"))
 
-        # Get the domain report from virustotal
+        # Make request
         try:
-            # Choose a random user agent string to use for any requests
             userAgent = random.choice(USER_AGENT)
-            session = requests.Session()
+            session = TimeoutSession()
             session.mount("https://", HTTP_ADAPTER)
             session.mount("http://", HTTP_ADAPTER)
             resp = session.get(url, headers={"User-Agent": userAgent})
-            requestsMade = requestsMade + 1
         except Exception as e:
-            write(
+            writerr(
                 colored(
-                    getSPACER(
-                        "[ ERR ] Unable to get links from virustotal.com: " + str(e)
-                    ),
+                    "VirusTotal - [ ERR ] Unable to get links from virustotal.com: " + str(e),
                     "red",
                 )
             )
             return
 
-        # Deal with any errors
+        # Handle HTTP errors
         if resp.status_code == 429:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ 429 ] VirusTotal rate limit reached so unable to get links."
-                    ),
+                    "VirusTotal - [ 429 ] Rate limit reached so unable to get links.",
                     "red",
                 )
             )
@@ -4484,9 +5728,7 @@ def getVirusTotalUrls():
         elif resp.status_code == 403:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ 403 ] VirusTotal: Permission denied. Check your API key is correct."
-                    ),
+                    "VirusTotal - [ 403 ] Permission denied. Check your API key is correct.",
                     "red",
                 )
             )
@@ -4494,101 +5736,102 @@ def getVirusTotalUrls():
         elif resp.status_code != 200:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ "
-                        + str(resp.status_code)
-                        + " ] Unable to get links from virustotal.com"
-                    ),
+                    "VirusTotal - [ ERR ] [ "
+                    + str(resp.status_code)
+                    + " ] Unable to get links from virustotal.com",
                     "red",
                 )
             )
             return
 
-        # Get the JSON response
+        # Parse JSON
         try:
             jsonResp = json.loads(resp.text.strip())
 
-            # Get the different URLs
+            # Normalize arrays as (url, scan_date) tuples
             if args.no_subs:
-                subDomains = []
+                subdomains = []
             else:
-                try:
-                    subDomains = jsonResp["subdomains"]
-                except Exception:
-                    subDomains = []
-            try:
-                detectedUrls = [
-                    entry["url"] for entry in jsonResp.get("detected_urls", [])
-                ]
-            except Exception:
-                detectedUrls = []
-            try:
-                undetectedUrls = [
-                    entry[0] for entry in jsonResp.get("undetected_urls", [])
-                ]
-            except Exception:
-                undetectedUrls = []
-            try:
-                totalUrls = set(subDomains + detectedUrls + undetectedUrls)
-            except Exception:
-                totalUrls = []
-        except Exception:
+                subdomains = [(sd, None) for sd in jsonResp.get("subdomains", [])]
+
+            detected_urls = [
+                (entry.get("url"), entry.get("scan_date"))
+                for entry in jsonResp.get("detected_urls", [])
+            ]
+
+            undetected_urls = [
+                (entry[0], entry[4]) for entry in jsonResp.get("undetected_urls", [])
+            ]
+
+            # Combine all
+            all_urls = subdomains + detected_urls + undetected_urls
+
+        except Exception as e:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ ERR ] There was an unexpected response from the VirusTotal API"
-                    ),
+                    "VirusTotal - [ ERR ] Unexpected response from the VirusTotal API: " + str(e),
                     "red",
                 )
             )
-            totalUrls = []
+            all_urls = []
 
+        # Check only mode
         if args.check_only:
             write(
-                colored("Get URLs from VirusTotal: ", "cyan")
+                colored("VirusTotal - [ INFO ] Get URLs from VirusTotal: ", "cyan")
                 + colored("1 request", "white")
             )
             checkVirusTotal = 1
         else:
-            # Carry on if something was found
-            for vturl in totalUrls:
-
-                if stopSource:
+            # Process each URL tuple
+            for url, scan_date in all_urls:
+                if stopSourceVirusTotal:
                     break
-
-                # Get memory in case it exceeds threshold
                 getMemory()
 
-                # Work out whether to include it
-                processVirusTotalUrl(vturl)
+                # Filter by date if -from or -to was passed and we have a date for the url
+                if scan_date and (args.from_date is not None or args.to_date is not None):
+                    urlDate = datetime.strptime(scan_date, "%Y-%m-%d %H:%M:%S")
+                    # If from date passed, check
+                    if args.from_date is not None:
+                        fromDate = parseDateArg(args.from_date)
+                        if urlDate < fromDate:
+                            continue
+                    # If to date passed, check
+                    if args.to_date is not None:
+                        toDate = parseDateArg(args.to_date)
+                        if urlDate >= toDate:
+                            continue
 
-            linkCount = len(linksFound) - originalLinkCount
-            if args.xwm and args.xcc and args.xav and args.xus:
+                # Process URL
+                processVirusTotalUrl(url)
+
+            # Show links found
+            if linksFoundVirusTotal is not None:
+                linkCountVirusTotal = len(linksFoundVirusTotal)
                 write(
-                    getSPACER(
-                        colored("Links found on virustotal.com: ", "cyan")
-                        + colored(str(linkCount), "white")
-                    )
-                    + "\n"
+                    colored("VirusTotal - [ INFO ] Links found on virustotal.com: ", "cyan")
+                    + colored(str(linkCountVirusTotal), "white")
                 )
+                if linksFound is not None:
+                    linksFound.update(linksFoundVirusTotal)
+                linksFoundVirusTotal.clear()
             else:
+                linkCountVirusTotal = 0
                 write(
-                    getSPACER(
-                        colored("Extra links found on virustotal.com: ", "cyan")
-                        + colored(str(linkCount), "white")
-                    )
-                    + "\n"
+                    colored("VirusTotal - [ INFO ] Links found on virustotal.com: ", "cyan")
+                    + colored("0", "white")
                 )
 
     except Exception as e:
-        writerr(colored("ERROR getVirusTotalUrls 1: " + str(e), "red"))
+        writerr(colored(f"ERROR getVirusTotalUrls: {e}", "red"))
 
 
 def processIntelxUrl(url):
     """
     Process a specific URL from intelx.io to determine whether to save the link
     """
-    global argsInput, argsInputHostname
+    global argsInput, argsInputHostname, linkCountIntelx, linksFoundIntelx
 
     addLink = True
 
@@ -4634,15 +5877,16 @@ def processIntelxUrl(url):
                             flags=re.IGNORECASE,
                         )
                     else:
-                        match = re.search(
-                            r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE
-                        )
+                        match = re.search(r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE)
                     if match is None:
                         addLink = False
 
         # Add link if it passed filters
         if addLink:
-            linksFoundAdd(url)
+            # Clean the link to remove any █ (\u2588) characters from the link. These can be present in the IntelX results when the Academia plan is used
+            url = url.replace("\u2588", "").strip()
+            if url != "":
+                linksFoundAdd(url, linksFoundIntelx)
 
     except Exception as e:
         writerr(colored("ERROR processIntelxUrl 1: " + str(e), "red"))
@@ -4653,99 +5897,107 @@ def processIntelxType(target, credits):
     target: 1 - Domains
     target: 3 - URLs
     """
+    initIntelxTls()
+    global intelxAPIIssue
     try:
-        try:
-            requestsMade = 0
+        attempts = 0
+        resp = None
+        # Choose a random user agent string to use for any requests and reuse session
+        userAgent = random.choice(USER_AGENT)
+        session = TimeoutSession()
+        session.mount("https://", HTTP_ADAPTER)
+        session.mount("http://", HTTP_ADAPTER)
 
-            # Choose a random user agent string to use for any requests
-            userAgent = random.choice(USER_AGENT)
-            session = requests.Session()
-            session.mount("https://", HTTP_ADAPTER)
-            session.mount("http://", HTTP_ADAPTER)
-            # Pass the API key in the X-Key header too.
-            resp = session.post(
-                INTELX_SEARCH_URL,
-                data='{"term":"'
-                + quote(argsInputHostname)
-                + '","target":'
-                + str(target)
-                + "}",
-                headers={"User-Agent": userAgent, "X-Key": INTELX_API_KEY},
-            )
-            requestsMade = requestsMade + 1
-        except Exception as e:
-            write(
-                colored(
-                    getSPACER("[ ERR ] Unable to get links from intelx.io: " + str(e)),
-                    "red",
+        while attempts < 2:
+            attempts += 1
+            try:
+                requestsMade = 0
+                # Pass the API key in the X-Key header too.
+                resp = session.post(
+                    intelx_tls.INTELX_SEARCH_URL,
+                    data='{"term":"' + quote(argsInputHostname) + '","target":' + str(target) + "}",
+                    headers={"User-Agent": userAgent, "X-Key": INTELX_API_KEY},
                 )
-            )
-            return
-
-        # Deal with any errors
-        if resp.status_code == 429:
-            writerr(
-                colored(
-                    getSPACER(
-                        "[ 429 ] IntelX rate limit reached so unable to get links."
-                    ),
-                    "red",
-                )
-            )
-            return
-        elif resp.status_code == 401:
-            writerr(
-                colored(
-                    getSPACER(
-                        "[ 401 ] IntelX: Not authorized. The source requires a paid API key. Check your API key is correct."
-                    ),
-                    "red",
-                )
-            )
-            return
-        elif resp.status_code == 402:
-            if credits.startswith("0/"):
-                writerr(
+                requestsMade = requestsMade + 1
+            except Exception as e:
+                write(
                     colored(
-                        getSPACER(
-                            "[ 402 ] IntelX: You have run out of daily credits on Intelx ("
-                            + credits
-                            + ")."
-                        ),
+                        "IntelX - [ ERR ] Unable to get links from intelx.io: " + str(e),
                         "red",
                     )
                 )
+                return
+
+            # Deal with any errors
+            if resp.status_code == 200:
+                break
+            elif resp.status_code == 429:
+                intelxAPIIssue = True
+                writerr(
+                    colored(
+                        "IntelX - [ 429 ] Rate limit reached so unable to get links.",
+                        "red",
+                    )
+                )
+                return
+            elif resp.status_code == 401:
+                # Retry with free endpoint if paid endpoint was used and auth failed
+                if intelx_tls.INTELX_BASE != INTELX_BASES[-1]:
+                    setIntelxBase(INTELX_BASES[-1])
+                    continue
+                intelxAPIIssue = True
+                writerr(
+                    colored(
+                        "IntelX - [ 401 ] Not authorized. Check your API key is correct.",
+                        "red",
+                    )
+                )
+                return
+            elif resp.status_code == 402:
+                # If we were on paid, fall back to free and retry once
+                if intelx_tls.INTELX_BASE != INTELX_BASES[-1]:
+                    setIntelxBase(INTELX_BASES[-1])
+                    continue
+                intelxAPIIssue = True
+                if credits.startswith("0/"):
+                    writerr(
+                        colored(
+                            "IntelX - [ 402 ] You have run out of daily credits on Intelx ("
+                            + credits
+                            + ").",
+                            "red",
+                        )
+                    )
+                else:
+                    writerr(
+                        colored(
+                            "IntelX - [ 402 ] It appears you have run out of daily credits on Intelx.",
+                            "red",
+                        )
+                    )
+                return
+            elif resp.status_code == 403:
+                intelxAPIIssue = True
+                writerr(
+                    colored(
+                        "IntelX - [ 403 ] Permission denied. Check your API key is correct.",
+                        "red",
+                    )
+                )
+                return
             else:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ 402 ] IntelX: It appears you have run out of daily credits on Intelx."
-                        ),
+                        "IntelX - [ "
+                        + str(resp.status_code)
+                        + " ] Unable to get links from intelx.io",
                         "red",
                     )
                 )
-            return
-        elif resp.status_code == 403:
-            writerr(
-                colored(
-                    getSPACER(
-                        "[ 403 ] IntelX: Permission denied. Check your API key is correct."
-                    ),
-                    "red",
-                )
-            )
-            return
-        elif resp.status_code != 200:
-            writerr(
-                colored(
-                    getSPACER(
-                        "[ "
-                        + str(resp.status_code)
-                        + " ] Unable to get links from intelx.io"
-                    ),
-                    "red",
-                )
-            )
+                return
+
+        # Double check we have a valid response
+        if resp is None or resp.status_code != 200:
             return
 
         # Get the JSON response
@@ -4755,9 +6007,7 @@ def processIntelxType(target, credits):
         except Exception:
             writerr(
                 colored(
-                    getSPACER(
-                        "[ ERR ] There was an unexpected response from the Intelligence API"
-                    ),
+                    "IntelX - [ ERR ] There was an unexpected response from the Intelligence API",
                     "red",
                 )
             )
@@ -4767,20 +6017,18 @@ def processIntelxType(target, credits):
         moreResults = True
         status = 0
         while moreResults:
-            if stopSource:
+            if stopSourceIntelx:
                 break
             try:
                 resp = session.get(
-                    INTELX_RESULTS_URL + id,
+                    intelx_tls.INTELX_RESULTS_URL + id,
                     headers={"User-Agent": userAgent, "X-Key": INTELX_API_KEY},
                 )
                 requestsMade = requestsMade + 1
             except Exception as e:
                 write(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Unable to get links from intelx.io: " + str(e)
-                        ),
+                        "IntelX - [ ERR ] Unable to get links from intelx.io: " + str(e),
                         "red",
                     )
                 )
@@ -4793,9 +6041,7 @@ def processIntelxType(target, credits):
             except Exception:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] There was an unexpected response from the Intelligence API"
-                        ),
+                        "IntelX - [ ERR ] There was an unexpected response from the Intelligence API",
                         "red",
                     )
                 )
@@ -4817,7 +6063,7 @@ def processIntelxType(target, credits):
             # Work out whether to include each url
             unique_values = list(set(selector_values + selector_valuesh))
             for ixurl in unique_values:
-                if stopSource:
+                if stopSourceIntelx:
                     break
                 processIntelxUrl(ixurl)
 
@@ -4830,29 +6076,19 @@ def processIntelxType(target, credits):
 
 def getIntelxAccountInfo() -> str:
     """
-    Get the account info and return the number of Credits remainiing from the /phonebook/search
+    Get the account info and return the number of Credits remaining from the /phonebook/search
     """
+    initIntelxTls()
     try:
-        # Choose a random user agent string to use for any requests
-        userAgent = random.choice(USER_AGENT)
-        session = requests.Session()
-        session.mount("https://", HTTP_ADAPTER)
-        session.mount("http://", HTTP_ADAPTER)
-        # Pass the API key in the X-Key header too.
-        resp = session.get(
-            INTELX_ACCOUNT_URL,
-            headers={"User-Agent": userAgent, "X-Key": INTELX_API_KEY},
-        )
+        resp = chooseIntelxBase(INTELX_API_KEY)
+        if resp is None or resp.status_code != 200:
+            return "Unknown"
         jsonResp = json.loads(resp.text.strip())
         credits = str(
-            jsonResp.get("paths", {})
-            .get("/phonebook/search", {})
-            .get("Credit", "Unknown")
+            jsonResp.get("paths", {}).get("/phonebook/search", {}).get("Credit", "Unknown")
         )
         credits_max = str(
-            jsonResp.get("paths", {})
-            .get("/phonebook/search", {})
-            .get("CreditMax", "Unknown")
+            jsonResp.get("paths", {}).get("/phonebook/search", {}).get("CreditMax", "Unknown")
         )
         return credits + "/" + credits_max
     except Exception:
@@ -4863,62 +6099,364 @@ def getIntelxUrls():
     """
     Get URLs from the Intelligence X Phonebook search
     """
-    global INTELX_API_KEY, linksFound, waymorePath, subs, stopProgram, stopSource, argsInput, checkIntelx, argsInputHostname
+    global INTELX_API_KEY, linksFound, waymorePath, subs, stopProgram, stopSourceIntelx, argsInput, checkIntelx, argsInputHostname, intelxAPIIssue, linkCountIntelx, linksFoundIntelx
 
     # Write the file of URL's for the passed domain/URL
     try:
         if args.check_only:
             write(
-                colored("Get URLs from Intelligence X: ", "cyan")
+                colored("IntelX - [ INFO ] Get URLs from Intelligence X: ", "cyan")
                 + colored("minimum 4 requests", "white")
             )
             checkIntelx = 4
             return
 
-        stopSource = False
-        originalLinkCount = len(linksFound)
+        stopSourceIntelx = False
+        linksFoundIntelx = set()
+        initIntelxTls()
+
         credits = getIntelxAccountInfo()
         if verbose():
             write(
                 colored(
-                    "The Intelligence X URL requested to get links (Credits: "
+                    "IntelX - [ INFO ] The Intelligence X URL requested to get links (Credits: "
                     + credits
                     + "): ",
                     "magenta",
                 )
-                + colored(INTELX_SEARCH_URL + "\n", "white")
+                + colored(intelx_tls.INTELX_SEARCH_URL + "\n", "white")
             )
 
         if not args.check_only:
-            write(colored("\rGetting links from intelx.io API...\r", "cyan"))
+            write(colored("IntelX - [ INFO ] Getting links from intelx.io API...", "cyan"))
 
         # Get the domains from Intelligence X if the --no-subs wasn't passed
         if not args.no_subs:
             processIntelxType(1, credits)
 
         # Get the URLs from Intelligence X
-        processIntelxType(3, credits)
+        if not intelxAPIIssue:
+            processIntelxType(3, credits)
 
-        linkCount = len(linksFound) - originalLinkCount
-        if args.xwm and args.xcc and args.xav and args.xus and args.xvt:
+        if linksFoundIntelx is not None:
+            linkCountIntelx = len(linksFoundIntelx)
             write(
-                getSPACER(
-                    colored("Links found on intelx.io: ", "cyan")
-                    + colored(str(linkCount), "white")
-                )
-                + "\n"
+                colored("IntelX - [ INFO ] Links found on intelx.io: ", "cyan")
+                + colored(str(linkCountIntelx), "white")
             )
+            if linksFound is not None:
+                linksFound.update(linksFoundIntelx)
+            linksFoundIntelx.clear()
         else:
+            linkCountIntelx = 0
             write(
-                getSPACER(
-                    colored("Extra links found on intelx.io: ", "cyan")
-                    + colored(str(linkCount), "white")
-                )
-                + "\n"
+                colored("IntelX - [ INFO ] Links found on intelx.io: ", "cyan")
+                + colored("0", "white")
             )
 
     except Exception as e:
         writerr(colored("ERROR getIntelxUrls 1: " + str(e), "red"))
+
+
+def processGhostArchiveUrl(url, ghostArchiveID=""):
+    """
+    Process a specific URL from ghostarchive.org to determine whether to save the link
+    """
+    global argsInput, argsInputHostname, links_lock, linkCountGhostArchive, linksFoundGhostArchive
+
+    addLink = True
+
+    try:
+        # Strip Wayback Machine prefix if present (e.g., https://web.archive.org/web/20230101120000_/https://example.com)
+        waybackMatch = re.match(r"^https?://web\.archive\.org/[^/]+/[a-zA-Z0-9]+_/", url)
+        if waybackMatch:
+            url = url[waybackMatch.end() :]
+
+        # If the input has a / in it, then a URL was passed, so the link will only be added if the URL matches
+        if "/" in url:
+            if argsInput not in url:
+                addLink = False
+
+        # If filters are required then test them
+        if addLink and not args.filter_responses_only:
+
+            # If the user requested -n / --no-subs then we don't want to add it if it has a sub domain (www. will not be classed as a sub domain)
+            if args.no_subs:
+                match = re.search(
+                    r"^[A-za-z]*\:\/\/(www\.)?" + re.escape(argsInputHostname),
+                    url,
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    addLink = False
+
+            # If the user didn't requested -f / --filter-responses-only then check http code
+            if addLink and not args.filter_responses_only:
+
+                # Check the URL exclusions
+                if addLink:
+                    match = re.search(
+                        r"(" + re.escape(FILTER_URL).replace(",", "|") + ")",
+                        url,
+                        flags=re.IGNORECASE,
+                    )
+                    if match is not None:
+                        addLink = False
+
+                # Set keywords filter if -ko argument passed
+                if addLink and args.keywords_only:
+                    if args.keywords_only == "#CONFIG":
+                        match = re.search(
+                            r"(" + re.escape(FILTER_KEYWORDS).replace(",", "|") + ")",
+                            url,
+                            flags=re.IGNORECASE,
+                        )
+                    else:
+                        match = re.search(r"(" + args.keywords_only + ")", url, flags=re.IGNORECASE)
+                    if match is None:
+                        addLink = False
+
+        # Add link if it passed filters
+        if addLink:
+            # Just get the hostname of the url
+            tldExtract = tldextract.extract(url)
+            subDomain = tldExtract.subdomain
+            if subDomain != "":
+                subDomain = subDomain + "."
+            domainOnly = subDomain + tldExtract.domain + "." + tldExtract.suffix
+
+            # GhostArchive might return URLs that aren't for the domain passed so we need to check for those and not process them
+            # Check the URL
+            match = re.search(
+                r"(^|\.)" + re.escape(argsInputHostname) + "$",
+                domainOnly,
+                flags=re.IGNORECASE,
+            )
+            if match is not None:
+                if args.mode in ("U", "B"):
+                    linksFoundAdd(url, linksFoundGhostArchive)
+                # If Response mode is requested then add the DOM ID to try later, for the number of responses wanted
+                if ghostArchiveID != "" and args.mode in ("R", "B"):
+                    if args.limit == 0 or len(ghostArchiveRequestLinks) < args.limit:
+                        with links_lock:
+                            ghostArchiveRequestLinks.add(
+                                (url, GHOSTARCHIVE_DOM_URL + ghostArchiveID)
+                            )
+
+    except Exception as e:
+        writerr(colored("ERROR processGhostArchiveUrl 1: " + str(e), "red"))
+
+
+def getGhostArchiveUrls():
+    """
+    Get URLs from GhostArchive (ghostarchive.org)
+    This source doesn't have an API, so we crawl the HTML pages directly.
+    """
+    global linksFound, path, subs, stopProgram, stopSourceGhostArchive, argsInput, checkGhostArchive, argsInputHostname, linkCountGhostArchive, linksFoundGhostArchive
+
+    try:
+        stopSourceGhostArchive = False
+        linksFoundGhostArchive = set()
+
+        # Build the base URL
+        # If there is only one . in the hostname, we can guarantee that a subdoman wasn't passed, so we can prefix with . to the links quicker as it won't include other domains that end with the target domain,
+        # Else, we need to get all and then confirm the actual host of the links later
+        if argsInputHostname.count(".") == 1:
+            baseUrl = GHOSTARCHIVE_URL.replace("{DOMAIN}", "." + quote(argsInput))
+        else:
+            baseUrl = GHOSTARCHIVE_URL.replace("{DOMAIN}", quote(argsInput))
+
+        if verbose():
+            write(
+                colored("GhostArchive - [ INFO ] The URL requested to get links: ", "magenta")
+                + colored(baseUrl + "0\n", "white")
+            )
+
+        if not args.check_only and args.mode == "U":
+            write(
+                colored(
+                    "GhostArchive - [ INFO ] Getting links from ghostarchive.org (this can take a while for some domains)...",
+                    "cyan",
+                )
+            )
+
+        # Set up session with cookie
+        session = TimeoutSession()
+        if HTTP_ADAPTER is not None:
+            session.mount("https://", HTTP_ADAPTER)
+            session.mount("http://", HTTP_ADAPTER)
+
+        userAgent = random.choice(USER_AGENT)
+        headers = {"User-Agent": userAgent}
+        cookies = {"theme": "original"}
+
+        pageNum = 0
+
+        while stopProgram is None and not stopSourceGhostArchive:
+            getMemory()
+
+            url = baseUrl + str(pageNum)
+
+            try:
+                resp = session.get(url, headers=headers, cookies=cookies, timeout=DEFAULT_TIMEOUT)
+            except Exception as e:
+                writerr(
+                    colored(
+                        "GhostArchive - [ ERR ] Unable to get page " + str(pageNum) + ": " + str(e),
+                        "red",
+                    )
+                )
+                break
+
+            if resp.status_code == 429:
+                writerr(
+                    colored(
+                        "GhostArchive - [ 429 ] Rate limit reached at page " + str(pageNum) + ".",
+                        "red",
+                    )
+                )
+                break
+
+            # Check for maintenance/end of results indicator
+            if (
+                resp.status_code == 503
+                or "The site is under maintenance and will be back soon" in resp.text
+                or "No archives for that site" in resp.text
+            ):
+                if verbose():
+                    if pageNum == 0:
+                        if args.check_only:
+                            checkGhostArchive = 1
+                            write(
+                                colored(
+                                    "GhostArchive - [ INFO ] Get URLs from GhostArchive: ", "cyan"
+                                )
+                                + colored("1 request", "white")
+                            )
+                        else:
+                            write(
+                                colored(
+                                    "GhostArchive - [ INFO ] No results found",
+                                    "cyan",
+                                )
+                            )
+                    else:
+                        write(
+                            colored(
+                                "GhostArchive - [ INFO ] Retrieved all results from "
+                                + str(pageNum)
+                                + " pages",
+                                "cyan",
+                            )
+                        )
+                break
+            if resp.status_code != 200:
+                writerr(
+                    colored(
+                        "GhostArchive - [ ERR ] [ "
+                        + str(resp.status_code)
+                        + " ] at page "
+                        + str(pageNum),
+                        "red",
+                    )
+                )
+                break
+
+            # Check only mode - just count pages
+            if args.check_only:
+                # For check only, we check if there are results and try to get total count
+                if pageNum == 0:
+                    # Check if there are any results on the first page
+                    if '<a href="/archive/' in resp.text:
+                        # Try to find "out of X" to determine total results/pages
+                        outOfMatch = re.search(r"out of (\d+)", resp.text)
+                        if outOfMatch:
+                            totalResults = int(outOfMatch.group(1))
+                            checkGhostArchive = totalResults
+                            write(
+                                colored(
+                                    "GhostArchive - [ INFO ] Get URLs from GhostArchive: ", "cyan"
+                                )
+                                + colored(f"{totalResults} requests (pagination required)", "white")
+                            )
+                        else:
+                            checkGhostArchive = 1
+                            write(
+                                colored(
+                                    "GhostArchive - [ INFO ] Get URLs from GhostArchive: ", "cyan"
+                                )
+                                + colored("unknown requests (pagination required)", "white")
+                            )
+                    else:
+                        checkGhostArchive = 1
+                        write(
+                            colored("GhostArchive - [ INFO ] Get URLs from GhostArchive: ", "cyan")
+                            + colored("1 request (no results)", "white")
+                        )
+                break
+
+            # Use regex to extract URLs from anchor tag text content
+            # Pattern matches: <a href="/archive/ID">URL_HERE</a> - captures both href path and URL
+            pattern = r'<a href="(/archive/[^"]*)">([^<]+)</a>'
+            matches = re.findall(pattern, resp.text)
+
+            # If no matches found, we've reached the end of results
+            if not matches:
+                if verbose():
+                    write(
+                        colored(
+                            "GhostArchive - [ INFO ] Retrieved all results from "
+                            + str(pageNum + 1)
+                            + " pages",
+                            "cyan",
+                        )
+                    )
+                break
+
+            for match in matches:
+                ghostArchiveId = match[0]  # e.g., "/archive/gkOOR"
+                potentialUrl = match[1].strip()
+                processGhostArchiveUrl(potentialUrl, ghostArchiveId)
+
+            # Check if there's a "Next Page" link - if not, we've reached the last page
+            # GhostArchive resets to Page 1 when exceeding actual pages, so checking for Next Page is essential
+            if "Next Page" not in resp.text and ">»</a>" not in resp.text:
+                if verbose():
+                    write(
+                        colored(
+                            "GhostArchive - [ INFO ] Retrieved all results from "
+                            + str(pageNum + 1)
+                            + " pages",
+                            "cyan",
+                        )
+                    )
+                break
+
+            pageNum += 1
+
+        if not args.check_only:
+            # Count links based on mode - in R mode, count response links; in U/B mode, count URL links
+            if args.mode == "R":
+                if ghostArchiveRequestLinks is not None:
+                    linkCountGhostArchive = len(ghostArchiveRequestLinks)
+                else:
+                    linkCountGhostArchive = 0
+            else:
+                if linksFoundGhostArchive is not None:
+                    linkCountGhostArchive = len(linksFoundGhostArchive)
+                else:
+                    linkCountGhostArchive = 0
+            write(
+                colored("GhostArchive - [ INFO ] Links found on ghostarchive.org: ", "cyan")
+                + colored(str(linkCountGhostArchive), "white")
+            )
+            if linksFoundGhostArchive is not None:
+                if linksFound is not None:
+                    linksFound.update(linksFoundGhostArchive)
+                linksFoundGhostArchive.clear()
+
+    except Exception as e:
+        writerr(colored("ERROR getGhostArchiveUrls 1: " + str(e), "red"))
 
 
 def processResponses():
@@ -4927,6 +6465,10 @@ def processResponses():
     """
     global stopProgram, totalFileCount
     try:
+
+        # Get responses from GhostArchive unless excluded
+        if stopProgram is None and not args.xga:
+            processResponsesGhostArchive()
 
         # Get responses from URLScan unless excluded
         if stopProgram is None and not args.xus:
@@ -4949,6 +6491,235 @@ def processResponses():
         writerr(colored(getSPACER("ERROR processResponses 1: " + str(e)), "red"))
 
 
+def processResponsesGhostArchive():
+    """
+    Get archived responses from GhostArchive (ghostarchive.org)
+    """
+    global subs, path, indexFile, totalResponses, stopProgram, argsInput, successCount, fileCount, DEFAULT_OUTPUT_DIR, responseOutputDirectory, ghostArchiveRequestLinks, failureCount, totalFileCount, checkGhostArchive
+    try:
+        fileCount = 0
+        failureCount = 0
+        if not args.check_only:
+            # Create 'results' and domain directory if needed
+            createDirs()
+
+            # Get the path of the files, depending on whether -oR / --output_responses was passed
+            try:
+                responsesPath = responseOutputDirectory + "responses.GhostArchive.tmp"
+                indexPath = responseOutputDirectory + "waymore_index.txt"
+            except Exception as e:
+                if verbose():
+                    writerr(colored("ERROR processResponsesGhostArchive 4: " + str(e), "red"))
+
+        # Get URLs from GhostArchive if the DOM ID's haven't been retrieved yet
+        if stopProgram is None and not args.check_only:
+            if args.mode in ("R", "B"):
+                write(
+                    colored(
+                        "GhostArchive - [ INFO ] Getting list of response links (this can take a while for some domains)...",
+                        "cyan",
+                    )
+                )
+            if args.mode == "R":
+                getGhostArchiveUrls()
+
+        # Check if a responses.GhostArchive.tmp files exists
+        if not args.check_only and os.path.exists(responsesPath):
+
+            # Load the links into the set
+            with open(responsesPath, "rb") as fl:
+                linkRequests = pickle.load(fl)
+
+        # Set start point
+        successCount = 0
+
+        # Get the URLScan DOM links
+        linkRequests = []
+        for originalUrl, domUrl in ghostArchiveRequestLinks:
+            linkRequests.append((originalUrl, domUrl))
+
+        # Write the links to a temp file
+        if not args.check_only:
+            with open(responsesPath, "wb") as f:
+                pickle.dump(linkRequests, f)
+
+        # Get the total number of responses we will try to get and set the current file count to the success count
+        totalResponses = len(linkRequests)
+        checkGhostArchive = checkGhostArchive + totalResponses
+
+        # If there are no reponses to download, diaplay an error and exit
+        if args.mode != "R" and totalResponses == 0:
+            writerr(
+                colored(
+                    getSPACER(
+                        "Failed to get responses from GhostArchive (ghostarchive.org) - check input and try again."
+                    ),
+                    "red",
+                )
+            )
+            return
+
+        fileCount = successCount
+
+        if args.check_only:
+            writerr(
+                colored("Downloading archived responses: ", "cyan")
+                + colored("UNKNOWN requests", "cyan")
+            )
+            writerr(
+                colored(
+                    "\n-> Downloading the responses can vary depending on the target and the rate limiting on GhostArchive",
+                    "green",
+                )
+            )
+            write("")
+        else:
+            # If the limit has been set over the default, give a warning that this could take a long time!
+            if totalResponses - successCount > DEFAULT_LIMIT:
+                if successCount > 0:
+                    writerr(
+                        colored(
+                            getSPACER(
+                                "WARNING: Downloading remaining "
+                                + str(totalResponses - successCount)
+                                + " responses may take a loooooooong time! Consider using arguments -ko, -l, -ci, -from and -to wisely!"
+                            ),
+                            "yellow",
+                        )
+                    )
+                else:
+                    writerr(
+                        colored(
+                            getSPACER(
+                                "WARNING: Downloading "
+                                + str(totalResponses)
+                                + " responses may take a loooooooong time! Consider using arguments -ko, -l, -ci, -from and -to wisely!"
+                            ),
+                            "yellow",
+                        )
+                    )
+
+            # Open the index file if hash value is going to be used (not URL)
+            if not args.url_filename:
+                indexFile = open(indexPath, "a")
+
+            # Process the URLs from GhostArchive
+            if stopProgram is None:
+                p = mp.Pool(
+                    args.processes * 2
+                )  # Double the number of processes to speed up the download
+                p.starmap(getGhostArchiveWARC, linkRequests[successCount:])
+                p.close()
+                p.join()
+
+            # Delete the tmp files now it has run successfully
+            if stopProgram is None:
+                try:
+                    os.remove(responsesPath)
+                except Exception:
+                    pass
+
+            # Close the index file if hash value is going to be used (not URL)
+            if not args.url_filename:
+                indexFile.close()
+
+        if not args.check_only:
+            try:
+                if failureCount > 0:
+                    if verbose():
+                        write(
+                            colored("GhostArchive - [ INFO ] Responses saved to ", "cyan")
+                            + colored(responseOutputDirectory, "white")
+                            + colored(" for " + subs + argsInput + ": ", "cyan")
+                            + colored(
+                                str(fileCount) + " 🤘",
+                                "white",
+                            )
+                            + colored(" (" + str(failureCount) + " not found)\n", "red")
+                        )
+                    else:
+                        write(
+                            colored("GhostArchive - [ INFO ] Responses saved to ", "cyan")
+                            + colored(responseOutputDirectory, "white")
+                            + colored(" for " + subs + argsInput + ": ", "cyan")
+                            + colored(str(fileCount) + " 🤘", "white")
+                            + colored(" (" + str(failureCount) + " not found)\n", "red")
+                        )
+                else:
+                    if verbose():
+                        write(
+                            colored("GhostArchive - [ INFO ] Responses saved to ", "cyan")
+                            + colored(responseOutputDirectory, "white")
+                            + colored(" for " + subs + argsInput + ": ", "cyan")
+                            + colored(str(fileCount) + " 🤘\n", "white")
+                        )
+                    else:
+                        write(
+                            colored("GhostArchive - [ INFO ] Responses saved to ", "cyan")
+                            + colored(responseOutputDirectory, "white")
+                            + colored(" for " + subs + argsInput + ": ", "cyan")
+                            + colored(str(fileCount) + " 🤘\n", "white")
+                        )
+            except Exception as e:
+                if verbose():
+                    writerr(colored("ERROR processResponsesGhostArchive 5: " + str(e), "red"))
+
+            # Append extra links from WARC files to URL output file (for mode B)
+            try:
+                if args.mode == "B" and len(extraWarcLinks) > 0:
+                    # Determine URL output file path (same logic as processURLOutput)
+                    if args.output_urls == "":
+                        if args.output_responses != "":
+                            urlFilePath = args.output_responses + "/waymore.txt"
+                        else:
+                            urlFilePath = (
+                                str(DEFAULT_OUTPUT_DIR)
+                                + "/results/"
+                                + str(argsInput).replace("/", "-")
+                                + "/waymore.txt"
+                            )
+                    else:
+                        urlFilePath = args.output_urls
+
+                    # Load existing URLs from file to avoid duplicates
+                    existingUrls = set()
+                    try:
+                        with open(urlFilePath) as f:
+                            for line in f:
+                                existingUrls.add(line.strip())
+                    except Exception:
+                        pass
+
+                    # Append only new unique URLs
+                    newLinks = [
+                        url
+                        for url in extraWarcLinks
+                        if url not in existingUrls and url not in linksFound
+                    ]
+                    if len(newLinks) > 0:
+                        with open(urlFilePath, "a") as f:
+                            for url in newLinks:
+                                f.write(url + "\n")
+
+                        # Display message about extra links
+                        write(
+                            colored("GhostArchive - [ INFO ] ", "cyan")
+                            + colored(str(len(newLinks)), "white")
+                            + colored(" extra links found in WARC files added to file ", "cyan")
+                            + colored(urlFilePath, "white")
+                            + "\n"
+                        )
+            except Exception as e:
+                if verbose():
+                    writerr(colored("ERROR processResponsesGhostArchive 6: " + str(e), "red"))
+
+        totalFileCount = totalFileCount + fileCount
+    except Exception as e:
+        writerr(colored(getSPACER("ERROR processResponsesGhostArchive 1: " + str(e)), "red"))
+    finally:
+        linkRequests = None
+
+
 def processResponsesURLScan():
     """
     Get archived responses from URLScan (urlscan.io)
@@ -4968,27 +6739,23 @@ def processResponsesURLScan():
                 indexPath = responseOutputDirectory + "waymore_index.txt"
             except Exception as e:
                 if verbose():
-                    writerr(
-                        colored("ERROR processResponsesURLScan 4: " + str(e), "red")
-                    )
+                    writerr(colored("ERROR processResponsesURLScan 4: " + str(e), "red"))
 
         # Get URLs from URLScan.io if the DOM ID's haven't been retrieved yet
-        if args.mode == "R" and stopProgram is None and not args.check_only:
-            write(
-                colored(
-                    "\rGetting list of response links (this can take a while for some domains)...\r",
-                    "cyan",
+        if stopProgram is None and not args.check_only:
+            if args.mode in ("R", "B"):
+                write(
+                    colored(
+                        "URLScan - [ INFO ] Getting list of response links (this can take a while for some domains)...",
+                        "cyan",
+                    )
                 )
-            )
-            getURLScanUrls()
+            if args.mode == "R":
+                getURLScanUrls()
 
         # Check if a continueResp.URLScan.tmp and responses.URLScan.tmp files exists
         runPrevious = "n"
-        if (
-            not args.check_only
-            and os.path.exists(continuePath)
-            and os.path.exists(responsesPath)
-        ):
+        if not args.check_only and os.path.exists(continuePath) and os.path.exists(responsesPath):
 
             # Load the links into the set
             with open(responsesPath, "rb") as fl:
@@ -4997,7 +6764,7 @@ def processResponsesURLScan():
 
             # Get the previous end position to start again at this point
             try:
-                with open(continuePath, "r") as fc:
+                with open(continuePath) as fc:
                     successCount = int(fc.readline().strip())
             except Exception:
                 successCount = 0
@@ -5082,25 +6849,6 @@ def processResponsesURLScan():
                     "green",
                 )
             )
-            # if args.limit == 5000 and totalResponses == 5000:
-            #     writerr(colored('Downloading archived responses: ','cyan')+colored(str(totalResponses+1)+' requests (the --limit argument defaults to '+str(DEFAULT_LIMIT)+')','cyan'))
-            # else:
-            #     writerr(colored('Downloading archived responses: ','cyan')+colored(str(totalResponses+1)+' requests','white'))
-            # minutes = round(totalResponses*2.5 // 60)
-            # hours = minutes // 60
-            # days = hours // 24
-            # if minutes < 5:
-            #     write(colored('\n-> Downloading the responses (depending on their size) should be quite quick!','green'))
-            # elif hours < 2:
-            #     write(colored('\n-> Downloading the responses (depending on their size) could take more than '+str(minutes)+' minutes.','green'))
-            # elif hours < 6:
-            #     write(colored('\n-> Downloading the responses (depending on their size) could take more than '+str(hours)+' hours.','green'))
-            # elif hours < 24:
-            #     write(colored('\n-> Downloading the responses (depending on their size) could take more than '+str(hours)+' hours.','yellow'))
-            # elif days < 7:
-            #     write(colored('\n-> Downloading the responses (depending on their size) could take more than '+str(days)+' days. Consider using arguments -ko, -l, -ci, -from and -to wisely! ','red'))
-            # else:
-            #     write(colored('\n-> Downloading the responses (depending on their size) could take more than '+str(days)+' days!!! Consider using arguments -ko, -l, -ci, -from and -to wisely!','red'))
             write("")
         else:
             # If the limit has been set over the default, give a warning that this could take a long time!
@@ -5162,7 +6910,7 @@ def processResponsesURLScan():
                 if failureCount > 0:
                     if verbose():
                         write(
-                            colored("\nURLScan responses saved to ", "cyan")
+                            colored("URLScan - [ INFO ] Responses saved to ", "cyan")
                             + colored(responseOutputDirectory, "white")
                             + colored(" for " + subs + argsInput + ": ", "cyan")
                             + colored(
@@ -5177,10 +6925,7 @@ def processResponsesURLScan():
                     else:
                         write(
                             colored(
-                                "\nURLScan responses saved for "
-                                + subs
-                                + argsInput
-                                + ": ",
+                                "URLScan - [ INFO ] Responses saved for " + subs + argsInput + ": ",
                                 "cyan",
                             )
                             + colored(
@@ -5195,7 +6940,10 @@ def processResponsesURLScan():
                 else:
                     if verbose():
                         write(
-                            colored("\nURLScan responses saved to ", "cyan")
+                            colored(
+                                "URLScan - [ INFO ] Responses saved for " + subs + argsInput + ": ",
+                                "cyan",
+                            )
                             + colored(responseOutputDirectory, "white")
                             + colored(" for " + subs + argsInput + ": ", "cyan")
                             + colored(
@@ -5209,10 +6957,7 @@ def processResponsesURLScan():
                     else:
                         write(
                             colored(
-                                "\nURLScan responses saved for "
-                                + subs
-                                + argsInput
-                                + ": ",
+                                "URLScan - [ INFO ] Responses saved for " + subs + argsInput + ": ",
                                 "cyan",
                             )
                             + colored(
@@ -5225,9 +6970,7 @@ def processResponsesURLScan():
                         )
             except Exception as e:
                 if verbose():
-                    writerr(
-                        colored("ERROR processResponsesURLScan 5: " + str(e), "red")
-                    )
+                    writerr(colored("ERROR processResponsesURLScan 5: " + str(e), "red"))
 
         totalFileCount = totalFileCount + fileCount
     except Exception as e:
@@ -5240,7 +6983,7 @@ def processResponsesWayback():
     """
     Get archived responses from Wayback Machine (archive.org)
     """
-    global linksFound, subs, path, indexFile, totalResponses, stopProgram, argsInput, continueRespFile, successCount, fileCount, DEFAULT_OUTPUT_DIR, responseOutputDirectory, failureCount, totalFileCount
+    global linksFound, subs, path, indexFile, totalResponses, stopProgram, argsInput, continueRespFile, successCount, fileCount, DEFAULT_OUTPUT_DIR, responseOutputDirectory, failureCount, totalFileCount, current_response, current_session
     try:
         fileCount = 0
         failureCount = 0
@@ -5255,17 +6998,11 @@ def processResponsesWayback():
                 indexPath = responseOutputDirectory + "waymore_index.txt"
             except Exception as e:
                 if verbose():
-                    writerr(
-                        colored("ERROR processResponsesWayback 4: " + str(e), "red")
-                    )
+                    writerr(colored("ERROR processResponsesWayback 4: " + str(e), "red"))
 
         # Check if a continueResp.tmp and responses.tmp files exists
         runPrevious = "n"
-        if (
-            not args.check_only
-            and os.path.exists(continuePath)
-            and os.path.exists(responsesPath)
-        ):
+        if not args.check_only and os.path.exists(continuePath) and os.path.exists(responsesPath):
 
             # Load the links into the set
             with open(responsesPath, "rb") as fl:
@@ -5274,7 +7011,7 @@ def processResponsesWayback():
 
             # Get the previous end position to start again at this point
             try:
-                with open(continuePath, "r") as fc:
+                with open(continuePath) as fc:
                     successCount = int(fc.readline().strip())
             except Exception:
                 successCount = 0
@@ -5335,13 +7072,9 @@ def processResponsesWayback():
             filterKeywords = ""
             if args.keywords_only:
                 if args.keywords_only == "#CONFIG":
-                    filterKeywords = (
-                        "&filter=original:.*("
-                        + re.escape(FILTER_KEYWORDS).replace(",", "|")
-                        + ").*"
-                    )
+                    filterKeywords = cdxKeywordsFilter(re.escape(FILTER_KEYWORDS).replace(",", "|"))
                 else:
-                    filterKeywords = "&filter=original:.*(" + args.keywords_only + ").*"
+                    filterKeywords = cdxKeywordsFilter(args.keywords_only)
 
             # Get the list again with filters and include timestamp
             linksFound = set()
@@ -5349,9 +7082,7 @@ def processResponsesWayback():
             # Set mime content type filter
             filterMIME = ""
             if MATCH_MIME.strip() != "":
-                filterMIME = "&filter=mimetype:" + re.escape(MATCH_MIME).replace(
-                    ",", "|"
-                )
+                filterMIME = "&filter=mimetype:" + re.escape(MATCH_MIME).replace(",", "|")
             else:
                 filterMIME = "&filter=!mimetype:warc/revisit"
                 filterMIME = filterMIME + "|" + re.escape(FILTER_MIME).replace(",", "|")
@@ -5359,13 +7090,9 @@ def processResponsesWayback():
             # Set status code filter
             filterCode = ""
             if MATCH_CODE.strip() != "":
-                filterCode = "&filter=statuscode:" + re.escape(MATCH_CODE).replace(
-                    ",", "|"
-                )
+                filterCode = "&filter=statuscode:" + re.escape(MATCH_CODE).replace(",", "|")
             else:
-                filterCode = "&filter=!statuscode:" + re.escape(FILTER_CODE).replace(
-                    ",", "|"
-                )
+                filterCode = "&filter=!statuscode:" + re.escape(FILTER_CODE).replace(",", "|")
 
             # Set the collapse parameter value in the archive.org URL. From the Wayback API docs:
             # "A new form of filtering is the option to 'collapse' results based on a field, or a substring of a field.
@@ -5377,9 +7104,7 @@ def processResponsesWayback():
                 collapse = "&collapse=timestamp:10"
             elif args.capture_interval == "d":  # get at most 1 capture per URL per day
                 collapse = "&collapse=timestamp:8"
-            elif (
-                args.capture_interval == "m"
-            ):  # get at most 1 capture per URL per month
+            elif args.capture_interval == "m":  # get at most 1 capture per URL per month
                 collapse = "&collapse=timestamp:6"
 
             url = (
@@ -5397,18 +7122,18 @@ def processResponsesWayback():
             if verbose():
                 write(
                     colored(
-                        "The Wayback Machine URL requested to get responses: ",
+                        "Wayback - [ INFO ] The URL requested to get responses: ",
                         "magenta",
                     )
                     + colored(url + "\n", "white")
                 )
 
             if args.check_only:
-                write(colored("\rChecking archived response requests...\r", "cyan"))
+                write(colored("Wayback - [ INFO ] Checking archived response requests...", "cyan"))
             else:
                 write(
                     colored(
-                        "\rGetting list of response links (this can take a while for some domains)...\r",
+                        "Wayback - [ INFO ] Getting list of response links (this can take a while for some domains)...",
                         "cyan",
                     )
                 )
@@ -5418,21 +7143,27 @@ def processResponsesWayback():
                 # Choose a random user agent string to use for any requests
                 success = True
                 userAgent = random.choice(USER_AGENT)
-                session = requests.Session()
+                session = TimeoutSession()
                 session.mount("https://", HTTP_ADAPTER)
                 session.mount("http://", HTTP_ADAPTER)
+                try:
+                    current_session = session
+                except Exception:
+                    pass
                 resp = session.get(
                     url,
                     stream=True,
                     headers={"User-Agent": userAgent},
                     timeout=args.timeout,
                 )
+                try:
+                    current_response = resp
+                except Exception:
+                    pass
             except ConnectionError:
                 writerr(
                     colored(
-                        getSPACER(
-                            "[ ERR ] Wayback Machine (archive.org) connection error"
-                        ),
+                        getSPACER("Wayback - [ ERR ] Connection error"),
                         "red",
                     )
                 )
@@ -5442,7 +7173,7 @@ def processResponsesWayback():
             except Exception as e:
                 writerr(
                     colored(
-                        getSPACER("[ ERR ] Couldn't get list of responses: " + str(e)),
+                        getSPACER("Wayback - [ ERR ] Couldn't get list of responses: " + str(e)),
                         "red",
                     )
                 )
@@ -5457,7 +7188,7 @@ def processResponsesWayback():
                             writerr(
                                 colored(
                                     getSPACER(
-                                        "No archived responses were found on Wayback Machine (archive.org) for the given search parameters."
+                                        "Wayback - [ ERR ] No archived responses were found on Wayback Machine (archive.org) for the given search parameters."
                                     ),
                                     "red",
                                 )
@@ -5468,7 +7199,7 @@ def processResponsesWayback():
                             writerr(
                                 colored(
                                     getSPACER(
-                                        "[ 429 ] Wayback Machine (archive.org) rate limit reached, so stopping. Links that have already been retrieved will be saved."
+                                        "Wayback - [ 429 ] Wayback Machine (archive.org) rate limit reached, so stopping. Links that have already been retrieved will be saved."
                                     ),
                                     "red",
                                 )
@@ -5479,7 +7210,7 @@ def processResponsesWayback():
                             writerr(
                                 colored(
                                     getSPACER(
-                                        "[ 503 ] Wayback Machine (archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify."
+                                        "Wayback - [ 503 ] Wayback Machine (archive.org) is currently unavailable. It may be down for maintenance. You can check https://web.archive.org/cdx/ to verify."
                                     ),
                                     "red",
                                 )
@@ -5491,7 +7222,7 @@ def processResponsesWayback():
                                 writerr(
                                     colored(
                                         getSPACER(
-                                            "[ "
+                                            "Wayback - [ "
                                             + str(resp.status_code)
                                             + " ] Error for "
                                             + url
@@ -5506,7 +7237,7 @@ def processResponsesWayback():
                                 writerr(
                                     colored(
                                         getSPACER(
-                                            "Failed to get links from Wayback Machine (archive.org) - consider removing -ko / --keywords-only argument, or changing FILTER_KEYWORDS in config.yml"
+                                            "Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - consider removing -ko / --keywords-only argument, or changing FILTER_KEYWORDS in config.yml"
                                         ),
                                         "red",
                                     )
@@ -5515,7 +7246,7 @@ def processResponsesWayback():
                                 writerr(
                                     colored(
                                         getSPACER(
-                                            "Failed to get links from Wayback Machine (archive.org) - consider removing -ko / --keywords-only argument, or changing the Regex value you passed"
+                                            "Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - consider removing -ko / --keywords-only argument, or changing the Regex value you passed"
                                         ),
                                         "red",
                                     )
@@ -5525,7 +7256,7 @@ def processResponsesWayback():
                                 writerr(
                                     colored(
                                         getSPACER(
-                                            "Failed to get links from Wayback Machine (archive.org) - Blocked Site Error (they block the target site)"
+                                            "Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - Blocked Site Error (they block the target site)"
                                         ),
                                         "red",
                                     )
@@ -5534,7 +7265,7 @@ def processResponsesWayback():
                                 writerr(
                                     colored(
                                         getSPACER(
-                                            "Failed to get links from Wayback Machine (archive.org) - check input domain and try again."
+                                            "Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - check input domain and try again."
                                         ),
                                         "red",
                                     )
@@ -5544,23 +7275,43 @@ def processResponsesWayback():
                     pass
 
             # Go through the response to save the links found
-            for line in resp.iter_lines():
-                try:
-                    results = line.decode("utf-8")
-                    parts = results.split(" ", 2)
-                    timestamp = parts[0]
-                    originalUrl = parts[1]
-                    linksFoundResponseAdd(timestamp + "/" + originalUrl)
-                except Exception:
-                    writerr(
-                        colored(
-                            getSPACER(
-                                "ERROR processResponsesWayback 3: Cannot to get link from line: "
-                                + str(line)
-                            ),
-                            "red",
+            try:
+                for line in resp.iter_lines():
+                    try:
+                        results = line.decode("utf-8")
+                        parts = results.split(" ", 2)
+                        timestamp = parts[0]
+                        originalUrl = parts[1]
+                        linksFoundResponseAdd(timestamp + "/" + originalUrl)
+                    except Exception:
+                        writerr(
+                            colored(
+                                getSPACER(
+                                    "ERROR processResponsesWayback 3: Cannot to get link from line: "
+                                    + str(line)
+                                ),
+                                "red",
+                            )
                         )
-                    )
+            finally:
+                try:
+                    current_response = None
+                except Exception:
+                    pass
+                try:
+                    current_session = None
+                except Exception:
+                    pass
+
+            # Cleanup shared response/session references now the response has been processed
+            try:
+                current_response = None
+            except Exception:
+                pass
+            try:
+                current_session = None
+            except Exception:
+                pass
 
             # Remove any links that have URL exclusions
             linkRequests = []
@@ -5574,8 +7325,7 @@ def processResponsesWayback():
                 # b) it does not match the URL exclusions
                 if (
                     args.regex_after is None
-                    or re.search(args.regex_after, link, flags=re.IGNORECASE)
-                    is not None
+                    or re.search(args.regex_after, link, flags=re.IGNORECASE) is not None
                 ) and exclusionRegex.search(link) is None:
                     linkRequests.append(link)
 
@@ -5594,7 +7344,7 @@ def processResponsesWayback():
                     writerr(
                         colored(
                             getSPACER(
-                                'Failed to get links from Wayback Machine (archive.org) - there were results (e.g. "'
+                                'Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - there were results (e.g. "'
                                 + originalUrl
                                 + "\") but they didn't match the input you gave. Check input and try again."
                             ),
@@ -5605,7 +7355,7 @@ def processResponsesWayback():
                 writerr(
                     colored(
                         getSPACER(
-                            "Failed to get links from Wayback Machine (archive.org) - check input and try again."
+                            "Wayback - [ ERR ] Failed to get links from Wayback Machine (archive.org) - check input and try again."
                         ),
                         "red",
                     )
@@ -5748,7 +7498,7 @@ def processResponsesWayback():
                 if failureCount > 0:
                     if verbose():
                         write(
-                            colored("\nWayback responses saved to ", "cyan")
+                            colored("Wayback - [ INFO ] Responses saved to ", "cyan")
                             + colored(responseOutputDirectory, "white")
                             + colored(" for " + subs + argsInput + ": ", "cyan")
                             + colored(
@@ -5763,10 +7513,7 @@ def processResponsesWayback():
                     else:
                         write(
                             colored(
-                                "\nWayback responses saved for "
-                                + subs
-                                + argsInput
-                                + ": ",
+                                "Wayback - [ INFO ] Responses saved for " + subs + argsInput + ": ",
                                 "cyan",
                             )
                             + colored(
@@ -5781,7 +7528,7 @@ def processResponsesWayback():
                 else:
                     if verbose():
                         write(
-                            colored("\nWayback responses saved to ", "cyan")
+                            colored("Wayback - [ INFO ] Responses saved to ", "cyan")
                             + colored(responseOutputDirectory, "white")
                             + colored(" for " + subs + argsInput + ": ", "cyan")
                             + colored(
@@ -5795,10 +7542,7 @@ def processResponsesWayback():
                     else:
                         write(
                             colored(
-                                "\nWayback responses saved for "
-                                + subs
-                                + argsInput
-                                + ": ",
+                                "Wayback - [ INFO ] Responses saved for " + subs + argsInput + ": ",
                                 "cyan",
                             )
                             + colored(
@@ -5811,9 +7555,7 @@ def processResponsesWayback():
                         )
             except Exception as e:
                 if verbose():
-                    writerr(
-                        colored("ERROR processResponsesWayback 5: " + str(e), "red")
-                    )
+                    writerr(colored("ERROR processResponsesWayback 5: " + str(e), "red"))
 
         totalFileCount = totalFileCount + fileCount
     except Exception as e:
@@ -5906,13 +7648,16 @@ def notifyDiscord():
             "username": "waymore",
         }
         try:
-            result = requests.post(WEBHOOK_DISCORD, json=data)
+            session = TimeoutSession()
+            if HTTP_ADAPTER is not None:
+                session.mount("https://", HTTP_ADAPTER)
+                session.mount("http://", HTTP_ADAPTER)
+            result = session.post(WEBHOOK_DISCORD, json=data)
             if 300 <= result.status_code < 200:
                 writerr(
                     colored(
                         getSPACER(
-                            "WARNING: Failed to send notification to Discord - "
-                            + result.json()
+                            "WARNING: Failed to send notification to Discord - " + result.json()
                         ),
                         "yellow",
                     )
@@ -5920,14 +7665,46 @@ def notifyDiscord():
         except Exception as e:
             writerr(
                 colored(
-                    getSPACER(
-                        "WARNING: Failed to send notification to Discord - " + str(e)
-                    ),
+                    getSPACER("WARNING: Failed to send notification to Discord - " + str(e)),
                     "yellow",
                 )
             )
     except Exception as e:
         writerr(colored("ERROR notifyDiscord 1: " + str(e), "red"))
+
+
+def notifyTelegram():
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, args
+    try:
+        url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "waymore has finished for `-i " + args.input + " -mode " + args.mode + "` ! 🤘",
+        }
+        try:
+            session = TimeoutSession()
+            if HTTP_ADAPTER is not None:
+                session.mount("https://", HTTP_ADAPTER)
+                session.mount("http://", HTTP_ADAPTER)
+            result = session.post(url, json=data)
+            if 300 <= result.status_code < 200:
+                writerr(
+                    colored(
+                        getSPACER(
+                            "WARNING: Failed to send notification to Telegram - " + result.json()
+                        ),
+                        "yellow",
+                    )
+                )
+        except Exception as e:
+            writerr(
+                colored(
+                    getSPACER("WARNING: Failed to send notification to Telegram - " + str(e)),
+                    "yellow",
+                )
+            )
+    except Exception as e:
+        writerr(colored("ERROR notifyTelegram 1: " + str(e), "red"))
 
 
 def checkScript(script):
@@ -6037,9 +7814,7 @@ def combineInlineJS():
 
         totalSections = len(uniqueScripts)
         sectionCounter = 0  # Counter for inline JS sections
-        currentOutputFile = os.path.join(
-            responseOutputDirectory, outputFileTemplate.format(1)
-        )
+        currentOutputFile = os.path.join(responseOutputDirectory, outputFileTemplate.format(1))
         currentSectionsWritten = 0  # Counter for sections written in current file
 
         if totalSections > 0:
@@ -6075,9 +7850,7 @@ def combineInlineJS():
                         currentSectionsWritten = 1
 
                     # Insert comment line for the beginning of the section
-                    inlineJSFile.write(
-                        f"//****** INLINE JS SECTION {sectionCounter} ******//\n\n"
-                    )
+                    inlineJSFile.write(f"//****** INLINE JS SECTION {sectionCounter} ******//\n\n")
 
                     # Write comments indicating the files the script was found in
                     files = ""
@@ -6111,10 +7884,7 @@ def combineInlineJS():
                 write(
                     colored("Created files ", "cyan")
                     + colored(
-                        responseOutputDirectory
-                        + "combinedInline{1-"
-                        + str(fileNumber)
-                        + "}.js",
+                        responseOutputDirectory + "combinedInline{1-" + str(fileNumber) + "}.js",
                         "white",
                     )
                     + colored(" (contents of inline JS)\n", "cyan")
@@ -6124,9 +7894,157 @@ def combineInlineJS():
         writerr(colored("ERROR combineInlineJS 1: " + str(e), "red"))
 
 
+# Async wrapper functions for concurrent source fetching
+async def fetch_wayback_async():
+    """Async wrapper for getWaybackUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getWaybackUrls)
+
+
+async def fetch_commoncrawl_async():
+    """Async wrapper for getCommonCrawlUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getCommonCrawlUrls)
+
+
+async def fetch_alienvault_async():
+    """Async wrapper for getAlienVaultUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getAlienVaultUrls)
+
+
+async def fetch_urlscan_async():
+    """Async wrapper for getURLScanUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getURLScanUrls)
+
+
+async def fetch_virustotal_async():
+    """Async wrapper for getVirusTotalUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getVirusTotalUrls)
+
+
+async def fetch_intelx_async():
+    """Async wrapper for getIntelxUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getIntelxUrls)
+
+
+async def fetch_ghostarchive_async():
+    """Async wrapper for getGhostArchiveUrls - runs in thread pool"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, getGhostArchiveUrls)
+
+
+async def fetch_all_sources_async():
+    """
+    Orchestrator function to fetch from all enabled sources concurrently.
+    Each source runs in its own thread pool executor while orchestration happens async.
+    """
+    global args, stopProgram, VIRUSTOTAL_API_KEY, INTELX_API_KEY, argsInput
+
+    tasks = []
+
+    # Build list of tasks for enabled sources
+    if not args.xwm and stopProgram is None:
+        tasks.append(("Wayback Machine", fetch_wayback_async()))
+    if not args.xcc and stopProgram is None:
+        tasks.append(("Common Crawl", fetch_commoncrawl_async()))
+    if not args.xav and stopProgram is None and not argsInput.startswith("."):
+        tasks.append(("AlienVault OTX", fetch_alienvault_async()))
+    if not args.xus and stopProgram is None:
+        tasks.append(("URLScan", fetch_urlscan_async()))
+    if not args.xvt and VIRUSTOTAL_API_KEY != "" and stopProgram is None:
+        tasks.append(("VirusTotal", fetch_virustotal_async()))
+    if not args.xix and INTELX_API_KEY != "" and stopProgram is None:
+        tasks.append(("Intelligence X", fetch_intelx_async()))
+    if not args.xga and stopProgram is None:
+        tasks.append(("GhostArchive", fetch_ghostarchive_async()))
+
+    if not tasks:
+        return
+
+    # Extract just the coroutines for gather
+    task_coros = [task[1] for task in tasks]
+
+    # Fetch all concurrently, capturing exceptions so one failure doesn't stop others
+    results = await asyncio.gather(*task_coros, return_exceptions=True)
+
+    # Check for any exceptions that occurred
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            source_name = tasks[i][0]
+            if verbose():
+                writerr(
+                    colored(
+                        getSPACER(f"ERROR in {source_name} during concurrent fetch: {str(result)}"),
+                        "red",
+                    )
+                )
+
+
+def ensureConfigExists():
+    """
+    Ensure the default config file exists before argument parsing.
+    This is called at the very start of main() so the config is created
+    even when running with -h or with no arguments.
+    """
+    try:
+        # Determine the default config path based on the OS
+        if os.name == "nt":
+            waymoreCfgPath = Path(os.path.join(os.getenv("APPDATA", ""), "waymore"))
+        elif sys.platform == "darwin":
+            waymoreCfgPath = Path(os.path.expanduser("~/Library/Application Support/waymore"))
+        else:
+            waymoreCfgPath = Path(os.path.expanduser("~/.config/waymore"))
+
+        configPath = waymoreCfgPath / "config.yml"
+
+        if not os.path.isfile(configPath):
+            # Make sure the directory exists
+            os.makedirs(configPath.parent, exist_ok=True)
+            # Create the default config content using the DEFAULT_* constants
+            defaultConfig = f"""FILTER_CODE: {DEFAULT_FILTER_CODE}
+FILTER_MIME: {DEFAULT_FILTER_MIME}
+FILTER_URL: {DEFAULT_FILTER_URL}
+FILTER_KEYWORDS: {DEFAULT_FILTER_KEYWORDS}
+URLSCAN_API_KEY:
+VIRUSTOTAL_API_KEY:
+CONTINUE_RESPONSES_IF_PIPED: True
+WEBHOOK_DISCORD: YOUR_WEBHOOK
+TELEGRAM_BOT_TOKEN: YOUR_TOKEN
+TELEGRAM_CHAT_ID: YOUR_CHAT_ID
+DEFAULT_OUTPUT_DIR:
+INTELX_API_KEY:
+SOURCE_IP:
+"""
+            with open(configPath, "w", encoding="utf-8") as f:
+                f.write(defaultConfig)
+            writerr(
+                colored(
+                    'Config file not found - created default config at "' + str(configPath) + '"',
+                    "yellow",
+                )
+            )
+    except Exception as e:
+        try:
+            writerr(
+                colored(
+                    "Config file not found, but failed to create default config file: " + str(e),
+                    "red",
+                )
+            )
+        except Exception:
+            pass
+
+
 # Run waymore
 def main():
-    global args, DEFAULT_TIMEOUT, inputValues, argsInput, linksFound, linkMimes, successCount, failureCount, fileCount, totalResponses, totalPages, indexFile, path, stopSource, stopProgram, VIRUSTOTAL_API_KEY, inputIsSubDomain, argsInputHostname, WEBHOOK_DISCORD, responseOutputDirectory, fileCount, INTELX_API_KEY
+    global args, DEFAULT_TIMEOUT, inputValues, argsInput, linksFound, linkMimes, successCount, failureCount, fileCount, totalResponses, totalPages, indexFile, path, stopSource, stopProgram, VIRUSTOTAL_API_KEY, inputIsSubDomain, argsInputHostname, WEBHOOK_DISCORD, responseOutputDirectory, fileCount, INTELX_API_KEY, stopSourceAlienVault, stopSourceCommonCrawl, stopSourceWayback, stopSourceURLScan, stopSourceVirusTotal, stopSourceIntelx, stopSourceGhostArchive, extraWarcLinks
+
+    # Ensure the default config file exists before anything else
+    ensureConfigExists()
 
     # Tell Python to run the handler() function when SIGINT is received
     signal(SIGINT, handler)
@@ -6283,25 +8201,25 @@ def main():
         default=False,
     )
     parser.add_argument(
+        "-xga",
+        action="store_true",
+        help="Exclude checks for links from ghostarchive.org",
+        default=False,
+    )
+    parser.add_argument(
         "--providers",
         action="store",
-        help="A comma separated list of source providers that you want to get URLs from. The values can be wayback,commoncrawl,otx,urlscan,virustotal and intelx. Passing this will override any exclude arguments (e.g. -xwm,-xcc, etc.) passed to exclude sources, and reset those based on what was passed with this argument.",
+        help="A comma separated list of source providers that you want to get URLs from. The values can be wayback,commoncrawl,otx,urlscan,virustotal,intelx and ghostarchive. Passing this will override any exclude arguments (e.g. -xwm,-xcc, etc.) passed to exclude sources, and reset those based on what was passed with this argument.",
         default=[],
         type=validateArgProviders,
-        metavar="{wayback,commoncrawl,otx,urlscan,virustotal,intelx}",
+        metavar="{wayback,commoncrawl,otx,urlscan,virustotal,intelx,ghostarchive}",
     )
     parser.add_argument(
         "-lcc",
         action="store",
         type=int,
         help="Limit the number of Common Crawl index collections searched, e.g. '-lcc 10' will just search the latest 10 collections (default: 1). As of November 2024 there are currently 106 collections. Setting to 0 (default) will search ALL collections. If you don't want to search Common Crawl at all, use the -xcc option.",
-    )
-    parser.add_argument(
-        "-lcy",
-        action="store",
-        type=int,
-        help="Limit the number of Common Crawl index collections searched by the year of the index data. The earliest index has data from 2008. Setting to 0 (default) will search collections or any year (but in conjuction with -lcc). For example, if you are only interested in data from 2015 and after, pass -lcy 2015. If you don't want to search Common Crawl at all, use the -xcc option.",
-        default=0,
+        default=1,
     )
     parser.add_argument(
         "-t",
@@ -6316,10 +8234,10 @@ def main():
     parser.add_argument(
         "-p",
         "--processes",
-        help="Basic multithreading is done when getting requests for a file of URLs. This argument determines the number of processes (threads) used (default: 1)",
+        help="Basic multithreading is done when getting requests for a file of URLs. This argument determines the number of processes (threads) used (default: 2)",
         action="store",
         type=validateArgProcesses,
-        default=1,
+        default=2,
         metavar="<integer>",
     )
     parser.add_argument(
@@ -6329,6 +8247,15 @@ def main():
         type=int,
         help="The number of retries for requests that get connection error or rate limited (default: 1).",
         default=1,
+    )
+    parser.add_argument(
+        "-sip",
+        "--source-ip",
+        "--bind-ip",
+        dest="source_ip",
+        action="store",
+        help="Bind outbound HTTP/HTTPS requests to this source IP (useful on multi-homed hosts).",
+        type=validateArgIPAddress,
     )
     parser.add_argument(
         "-m",
@@ -6343,7 +8270,7 @@ def main():
         "-ko",
         "--keywords-only",
         action="store",
-        help=r'Only return links and responses that contain keywords that you are interested in. This can reduce the time it takes to get results. If you provide the flag with no value, Keywords are taken from the comma separated list in the "config.yml" file with the "FILTER_KEYWORDS" key, otherwise you can pass an specific Regex value to use, e.g. -ko "admin" to only get links containing the word admin, or -ko "\.js(\?|$)" to only get JS files. The Regex check is NOT case sensitive.',
+        help=r"Only return links and responses that contain keywords that you are interested in. This can reduce the time it takes to get results. If you provide the flag with no value, Keywords are taken from the comma separated list in the \"config.yml\" file with the \"FILTER_KEYWORDS\" key, otherwise you can pass a specific Python Regex value. e.g. -ko 'admin' to only get links containing the word admin, or -ko '\.js(\?.*|$)' to only get JS files. The Regex check is NOT case sensitive. NOTE: The pattern is used as an approximate pre-filter on the Wayback CDX API (wrapped as .*pattern.*, so anchors like $ may not behave as expected at the CDX level), then applied exactly as a Python regex locally. Use single quotes to avoid shell expansion of $ and other special characters.",
         nargs="?",
         const="#CONFIG",
     )
@@ -6406,6 +8333,12 @@ def main():
         help="Whether to send a notification to Discord when waymore completes. It requires WEBHOOK_DISCORD to be provided in the config.yml file.",
     )
     parser.add_argument(
+        "-nt",
+        "--notify-telegram",
+        action="store_true",
+        help="Whether to send a notification to Telegram when waymore completes. It requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to be provided in the config.yml file.",
+    )
+    parser.add_argument(
         "-oijs",
         "--output-inline-js",
         action="store_true",
@@ -6420,12 +8353,33 @@ def main():
         showVersion()
         sys.exit()
 
-    # If -lcc wasn't passed then set to the default of 1 if -lcy is 0. This will make them work together
-    if args.lcc is None:
-        if args.lcy == 0:
-            args.lcc = 1
-        else:
-            args.lcc = 0
+    # Validate -ra and -ko regex patterns early so corrupted patterns (e.g. from
+    # bash $-expansion inside double-quoted strings) give a clear error instead of
+    # silently returning zero results.
+    if args.regex_after is not None:
+        try:
+            re.compile(args.regex_after)
+        except re.error as e:
+            writerr(
+                colored(
+                    f"ERROR: -ra / --regex-after value is not a valid regex: {e}\n"
+                    "TIP: Use single quotes to avoid shell expansion, e.g. -ra '\\. js(\\?|$)'",
+                    "red",
+                )
+            )
+            sys.exit()
+    if args.keywords_only is not None and args.keywords_only != "#CONFIG":
+        try:
+            re.compile(args.keywords_only)
+        except re.error as e:
+            writerr(
+                colored(
+                    f"ERROR: -ko / --keywords-only value is not a valid regex: {e}\n"
+                    "TIP: Use single quotes to avoid shell expansion, e.g. -ko '\\. js(\\?|$)'",
+                    "red",
+                )
+            )
+            sys.exit()
 
     # If --providers was passed, then manually set the exclude arguments;
     if args.providers:
@@ -6453,6 +8407,10 @@ def main():
             args.xix = True
         else:
             args.xix = False
+        if "ghostarchive" not in args.providers:
+            args.xga = True
+        else:
+            args.xga = False
 
     # If no input was given, raise an error
     if sys.stdin.isatty():
@@ -6482,7 +8440,13 @@ def main():
         # For each input (maybe multiple if a file was passed)
         for inpt in inputValues:
 
-            argsInput = inpt.strip().rstrip("\n").strip(".").lower()
+            # Strip and clean the input, but only lowercase the hostname (paths are case-sensitive)
+            cleaned = inpt.strip().rstrip("\n").strip(".")
+            if "/" in cleaned:
+                hostname_part, path_part = cleaned.split("/", 1)
+                argsInput = hostname_part.lower() + "/" + path_part
+            else:
+                argsInput = cleaned.lower()
 
             # Get the input hostname
             tldExtract = tldextract.extract(argsInput)
@@ -6523,6 +8487,7 @@ def main():
             # Reset global variables
             linksFound = set()
             linkMimes = set()
+            extraWarcLinks = set()
             successCount = 0
             failureCount = 0
             fileCount = 0
@@ -6531,6 +8496,13 @@ def main():
             indexFile = None
             path = ""
             stopSource = False
+            stopSourceWayback = False
+            stopSourceCommonCrawl = False
+            stopSourceAlienVault = False
+            stopSourceURLScan = False
+            stopSourceVirusTotal = False
+            stopSourceIntelx = False
+            stopSourceGhostArchive = False
 
             # Get the config settings from the config.yml file
             getConfig()
@@ -6548,29 +8520,17 @@ def main():
             # If the mode is U (URLs retrieved) or B (URLs retrieved AND Responses downloaded)
             if args.mode in ["U", "B"]:
 
-                # If not requested to exclude, get URLs from the Wayback Machine (archive.org)
-                if not args.xwm and stopProgram is None:
-                    getWaybackUrls()
-
-                # If not requested to exclude, get URLs from commoncrawl.org
-                if not args.xcc and stopProgram is None:
-                    getCommonCrawlUrls()
-
-                # If not requested to exclude and a TLD wasn't passed, get URLs from alienvault.com
-                if not args.xav and stopProgram is None and not inpt.startswith("."):
-                    getAlienVaultUrls()
-
-                # If not requested to exclude, get URLs from urlscan.io
-                if not args.xus and stopProgram is None:
-                    getURLScanUrls()
-
-                # If not requested to exclude, get URLs from virustotal.com if we have an API key
-                if not args.xvt and VIRUSTOTAL_API_KEY != "" and stopProgram is None:
-                    getVirusTotalUrls()
-
-                # If not requested to exclude, get URLs from intelx.io if we have an API key
-                if not args.xix and INTELX_API_KEY != "" and stopProgram is None:
-                    getIntelxUrls()
+                # Fetch from all sources concurrently using async/await
+                try:
+                    asyncio.run(fetch_all_sources_async())
+                except Exception as e:
+                    if verbose():
+                        writerr(
+                            colored(
+                                getSPACER(f"ERROR during concurrent source fetching: {str(e)}"),
+                                "red",
+                            )
+                        )
 
                 # Output results of all searches
                 processURLOutput()
@@ -6637,10 +8597,15 @@ def main():
         writerr(colored("ERROR main 1: " + str(e), "red"))
 
     finally:
-        # Send a notification to discord if requested
+        # Send a notification to discord or telegram if requested
         try:
             if args.notify_discord and WEBHOOK_DISCORD != "":
                 notifyDiscord()
+        except Exception:
+            pass
+        try:
+            if args.notify_telegram and TELEGRAM_BOT_TOKEN != "" and TELEGRAM_CHAT_ID != "":
+                notifyTelegram()
         except Exception:
             pass
         try:
